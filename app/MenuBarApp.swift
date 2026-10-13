@@ -53,19 +53,21 @@ private struct AppSettings: Codable {
     var rightID = ""
     var host = "4.3.2.1"
     var ledCount = 30
-    var layout = "perimeter"
+    // Whole picture: a flash in mid-frame -- a sword strike -- must register,
+    // and edge sampling can miss it.
+    var layout = "whole"
     var displayIndex = 0
     var displayID: UInt32?
     var windowID: UInt32?
     var useCrop = false
     var crop = [0.0, 0.0, 1.0, 1.0]
-    var brightness = 0.35
-    var saturation = 1.3
-    var darkLift = 0.18
-    var response = 0.12
+    var brightness = 1.0
+    var saturation = 1.5
+    var darkLift = 0.20
+    var response = 0.25
     /// How long brightness takes to fall after a flash. Optional so settings
     /// saved by v1.1 still decode.
-    var afterglow: Double? = 0.6
+    var afterglow: Double? = 0.8
     /// Master brightness applied by the lamp instead of in software.
     var lampDimming: Bool? = true
     var gamma = 1.6
@@ -112,7 +114,7 @@ private struct AppSettings: Codable {
         // Brightness rises fast enough that a flash on screen lights the room
         // at once, and falls over the afterglow. Ambient stays gentle both ways.
         c.attackTime = mode == .ambient ? max(0.5, response) : min(response, 0.05)
-        c.releaseTime = mode == .ambient ? max(1.5, afterglow ?? 0.6) : (afterglow ?? 0.6)
+        c.releaseTime = mode == .ambient ? max(1.5, afterglow ?? 0.8) : (afterglow ?? 0.8)
         c.hardwareBrightness = lampDimming ?? true
         c.gamma = gamma; c.audioDepth = audioDepth; c.audio = mode == .sound
         c.edgeDepth = edgeDepth; c.excludeSubtitles = excludeSubtitles; c.letterbox = letterbox
@@ -491,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               sliderRow("saturation", title: "Saturation", value: settings.saturation, range: 0...2.5),
               sliderRow("darkLift", title: "Dark-scene lift", value: settings.darkLift, range: 0...0.6),
               sliderRow("response", title: "Response time", value: settings.response, range: 0.02...1.2),
-              sliderRow("afterglow", title: "Afterglow", value: settings.afterglow ?? 0.6, range: 0.05...2),
+              sliderRow("afterglow", title: "Afterglow", value: settings.afterglow ?? 0.8, range: 0.05...2),
               sliderRow("gamma", title: "Gamma", value: settings.gamma, range: 0.6...3),
               sliderRow("audioDepth", title: "Audio depth", value: settings.audioDepth, range: 0...1),
               sliderRow("edgeDepth", title: "Edge depth", value: settings.edgeDepth, range: 0.05...0.4),
@@ -638,7 +640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func markPending() { resultLabel.stringValue = "Changes take effect when you choose Apply."; resultLabel.textColor = .secondaryLabelColor }
     @objc private func resetTuning() {
         let defaults = AppSettings()
-        for (key, value) in [("brightness", defaults.brightness), ("saturation", defaults.saturation), ("darkLift", defaults.darkLift), ("response", defaults.response), ("afterglow", defaults.afterglow ?? 0.6), ("gamma", defaults.gamma), ("audioDepth", defaults.audioDepth), ("edgeDepth", defaults.edgeDepth)] {
+        for (key, value) in [("brightness", defaults.brightness), ("saturation", defaults.saturation), ("darkLift", defaults.darkLift), ("response", defaults.response), ("afterglow", defaults.afterglow ?? 0.8), ("gamma", defaults.gamma), ("audioDepth", defaults.audioDepth), ("edgeDepth", defaults.edgeDepth)] {
             sliders[key]?.doubleValue = value; updateSliderLabel(key)
         }
         subtitleToggle.state = .on; letterboxToggle.state = .on; lampDimmingToggle.state = .on; markPending()
