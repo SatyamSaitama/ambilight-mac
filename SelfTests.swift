@@ -122,7 +122,9 @@ func runImmersionTests() -> Bool {
     var fading = ColorPipeline(cfg: cfg)
     _ = fading.process([0.8, 0.4, 0.2], luminances: [0.5], snap: true)
     var previous = 256, monotonic = true, faded: [UInt8] = []
-    for _ in 0..<120 {
+    // Four seconds: the brightness release is a deliberate afterglow, and at
+    // gamma 1 its tail reaches the last 8-bit step after about three.
+    for _ in 0..<240 {
         faded = fading.process([0, 0, 0], luminances: [0], deltaTime: 1.0 / 60)
         let peak = Int(faded.max() ?? 0)
         monotonic = monotonic && peak <= previous; previous = peak
@@ -138,6 +140,8 @@ func runImmersionTests() -> Bool {
     var timed = cfg
     timed.layout = .whole; timed.bleName = "offline-test"
     timed.responseTime = 0.04; timed.cutThreshold = 1; timed.fps = 60
+    // This checks the output clock, not the afterglow: keep the release fast.
+    timed.attackTime = 0.04; timed.releaseTime = 0.04
     let recorder = RecordingSink()
     let handler = FrameHandler(cfg: timed, sink: recorder)
     handler.start()
@@ -157,6 +161,57 @@ func runImmersionTests() -> Bool {
     let stoppedCount = recorder.snapshot().count
     Thread.sleep(forTimeInterval: 0.05)
     check("stopping a handler cancels subsequent output ticks", recorder.snapshot().count == stoppedCount)
+
+    print("brightness envelope:")
+    var env = Config()
+    env.bleName = nil; env.gamma = 1; env.brightness = 1; env.saturation = 1
+    env.normalize = 0; env.blackPoint = 0; env.vividness = 0
+    env.responseTime = 0.12; env.attackTime = 0.05; env.releaseTime = 0.6
+    let warm = [0.8, 0.4, 0.2], dim = [0.08, 0.04, 0.02]
+    func settled(_ c: Config, _ rgb: [Double], _ lum: Double) -> [UInt8] {
+        var p = ColorPipeline(cfg: c); return p.process(rgb, luminances: [lum], snap: true)
+    }
+    check("a settled colour is unchanged by the envelope",
+          settled(env, warm, 0.47) == [204, 102, 51], "\(settled(env, warm, 0.47))")
+
+    var rise = ColorPipeline(cfg: env)
+    _ = rise.process([0, 0, 0], luminances: [0], snap: true)
+    var risen: [UInt8] = []
+    for _ in 0..<9 { risen = rise.process(warm, luminances: [0.47], deltaTime: 1.0 / 60) }
+    check("a flash reaches most of its brightness within 150 ms",
+          Double(risen[0]) >= 0.85 * 204, "\(risen)")
+
+    var glow = ColorPipeline(cfg: env)
+    _ = glow.process(warm, luminances: [0.47], snap: true)
+    var after: [UInt8] = []
+    for _ in 0..<18 { after = glow.process(dim, luminances: [0.047], deltaTime: 1.0 / 60) }
+    let dimSettled = settled(env, dim, 0.047)
+    check("after a flash the light lingers as an afterglow",
+          Double(after[0]) > 2.5 * Double(dimSettled[0]), "\(after) vs settled \(dimSettled)")
+
+    var hue = ColorPipeline(cfg: env)
+    _ = hue.process([0.9, 0.1, 0.1], luminances: [0.25], snap: true)
+    var fadingRed: [UInt8] = []
+    for _ in 0..<30 { fadingRed = hue.process([0, 0, 0], luminances: [0], deltaTime: 1.0 / 60) }
+    check("the afterglow fades in the colour of the flash, not grey",
+          fadingRed[0] > 0 && Int(fadingRed[0]) >= 4 * Int(max(fadingRed[1], fadingRed[2])), "\(fadingRed)")
+
+    var cutP = ColorPipeline(cfg: env)
+    _ = cutP.process([0.9, 0.2, 0.1], luminances: [0.35], snap: true)
+    let dimBlue = [0.02, 0.04, 0.3]
+    let afterCut = cutP.process(dimBlue, luminances: [0.05], deltaTime: 1.0 / 60, cut: true)
+    let blueSettled = settled(env, dimBlue, 0.05)
+    check("a cut switches colour at once but eases brightness down",
+          afterCut[2] > afterCut[0] && Int(afterCut[2]) > Int(blueSettled[2]) + 10,
+          "\(afterCut) vs settled \(blueSettled)")
+
+    var lamp = env; lamp.bleName = "test"; lamp.brightness = 0.35; lamp.hardwareBrightness = true
+    var software = lamp; software.hardwareBrightness = false
+    let byLamp = settled(lamp, [1, 1, 1], 1), bySoftware = settled(software, [1, 1, 1], 1)
+    check("lamp-side dimming sends colour at full range",
+          byLamp == [255, 255, 255] && bySoftware == [89, 89, 89], "\(byLamp) / \(bySoftware)")
+    var wled = lamp; wled.bleName = nil
+    check("WLED is always dimmed in software", settled(wled, [1, 1, 1], 1) == [89, 89, 89])
 
     print("crop, calibration and picture bounds:")
     cfg.layout = .whole; cfg.bleName = nil; cfg.vividness = 0; cfg.excludeSubtitles = false

@@ -32,6 +32,18 @@ struct Config {
     var edgeDepth = 0.20
     var excludeSubtitles = true
     var responseTime = 0.12
+
+    /// Brightness envelope, separate from colour. It rises fast so a flash on
+    /// screen -- a sword strike, an explosion -- lights the room at once, and
+    /// falls slowly so each flash leaves a short afterglow instead of blinking
+    /// off. Colour still follows `responseTime`.
+    var attackTime = 0.05
+    var releaseTime = 0.6
+
+    /// Let the lamp do the master dimming: set its own BRIGHTNESS once and send
+    /// colour at full range, instead of scaling colour down in software. At low
+    /// brightness that leaves far more 8-bit steps for dark scenes.
+    var hardwareBrightness = true
     var leftGain = [1.0, 1.0, 1.0]
     var rightGain = [1.0, 1.0, 1.0]
     var reverseLeft = false
@@ -192,6 +204,10 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         case "--analysis-width": c.analysisWidth = Int(val()) ?? 192
         case "--edge-depth": c.edgeDepth = Double(val()) ?? 0.2
         case "--response-ms": c.responseTime = (Double(val()) ?? 120) / 1000
+        case "--attack-ms":   c.attackTime = (Double(val()) ?? 50) / 1000
+        case "--release-ms":  c.releaseTime = (Double(val()) ?? 600) / 1000
+        case "--hw-brightness":    c.hardwareBrightness = true
+        case "--no-hw-brightness": c.hardwareBrightness = false
         case "--black-point": c.blackPoint = Double(val()) ?? 0.025
         case "--include-subtitles": c.excludeSubtitles = false
         case "--reverse-left": c.reverseLeft = true
@@ -280,6 +296,9 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
               --analysis-width <n> capture width, independent of light count (192)
               --edge-depth <0.05..0.5> inward depth of edge regions (0.20)
               --response-ms <n>    smoothing time constant (120)
+              --attack-ms <n>      brightness rise time (50); keeps flashes instant
+              --release-ms <n>     brightness fall time (600); the afterglow
+              --no-hw-brightness   scale brightness in software, not on the lamp
               --black-point <n>    black threshold (movie: 0.025)
               --include-subtitles include bottom-centre text in sampling
               --left-gain <r,g,b>  channel calibration multipliers (0...2)
@@ -374,7 +393,7 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
             // Lower normalize than punchy on purpose: films use darkness
             // deliberately, and lifting every night scene to full brightness
             // fights the thing you are watching.
-            p = (0.20, 1.30, 0.18, 0.35, 15, 2, 0.45, 0.18)
+            p = (0.20, 1.30, 0.18, 0.35, 15, 1, 0.45, 0.18)
             if !c.explicit.contains("--gamma") { c.gamma = 1.6 }
             if !c.explicit.contains("--black-point") { c.blackPoint = 0.025 }
             if !c.explicit.contains("--no-letterbox") { c.letterbox = true }
@@ -398,6 +417,14 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
             default: c.responseTime = 0.12
             }
         }
+        let (attack, release): (Double, Double)
+        switch name.lowercased() {
+        case "calm":   (attack, release) = (0.5, 1.5)
+        case "punchy": (attack, release) = (0.03, 0.3)
+        default:       (attack, release) = (0.05, 0.6)
+        }
+        if !c.explicit.contains("--attack-ms")  { c.attackTime = attack }
+        if !c.explicit.contains("--release-ms") { c.releaseTime = release }
     }
     if c.bleRightID != nil && !c.explicit.contains("--layout") { c.layout = .sides }
     return c

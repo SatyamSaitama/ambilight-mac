@@ -233,19 +233,35 @@ func expandLightZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
 
 struct ColorPipeline {
     let cfg: Config
-    private var smoothed: [Double] = []
+    /// Chroma: each zone's colour with brightness factored out, scaled so its
+    /// brightest channel is 1.
+    private var chroma: [Double] = []
+    /// Brightness envelope per zone, in luma.
+    private var level: [Double] = []
     private var dark: [Bool] = []
 
     init(cfg: Config) { self.cfg = cfg }
 
     /// Samples are normalized capture RGB, not assumed linear-light values. Gamma
     /// is a calibrated output transfer; chroma reduction happens before this stage.
+    ///
+    /// Colour and brightness are smoothed separately. Colour follows
+    /// `responseTime` so the lamp keeps up with the picture. Brightness rises
+    /// with `attackTime` and falls with `releaseTime`: a flash lights the room
+    /// at once and then fades out as an afterglow, rather than blinking off as
+    /// fast as it came on.
+    ///
+    /// - `snap`: settle everything at once (static colours).
+    /// - `cut`: a scene cut. Colour snaps; brightness keeps its envelope, so a
+    ///   cut to a darker shot eases down instead of blinking.
     mutating func process(_ raw: [Double], luminances: [Double]? = nil,
-                          deltaTime: Double = 1.0 / 60.0, snap: Bool = false) -> [UInt8] {
+                          deltaTime: Double = 1.0 / 60.0, snap: Bool = false,
+                          cut: Bool = false) -> [UInt8] {
         let n = raw.count / 3
         guard n > 0 else { return [] }
-        if smoothed.count != n * 3 {
-            smoothed = Array(repeating: 0, count: n * 3)
+        if chroma.count != n * 3 {
+            chroma = Array(repeating: 1, count: n * 3)     // neutral until a hue arrives
+            level = Array(repeating: 0, count: n)
             dark = Array(repeating: false, count: n)
         }
         let dt = deltaTime.isFinite ? max(0, min(2, deltaTime)) : 1.0 / 60.0
@@ -255,7 +271,19 @@ struct ColorPipeline {
             let alpha = max(0.0001, min(0.9999, cfg.smoothing))
             tau = -(1.0 / 60.0) / log(1 - alpha)
         }
-        let alpha = snap || (cfg.responseTime == 0 && !cfg.explicit.contains("--smoothing")) ? 1 : 1 - exp(-dt / tau)
+        let zeroResponse = cfg.responseTime == 0 && !cfg.explicit.contains("--smoothing")
+        let alpha = snap || cut || zeroResponse ? 1 : 1 - exp(-dt / tau)
+        func envelope(_ t: Double) -> Double { snap || t <= 0 ? 1 : 1 - exp(-dt / t) }
+        // Brightness never rises slower than colour moves, so a zero response
+        // time still means immediate.
+        let attack = envelope(zeroResponse ? 0 : min(cfg.attackTime, tau))
+        let release = envelope(cfg.releaseTime)
+
+        // With lamp-side dimming the master brightness is applied by the
+        // controller, so colour goes out at full range. WLED has no such
+        // setting, so it is always scaled here.
+        let gain = cfg.hardwareBrightness && cfg.bleName != nil ? 1 : unit(cfg.brightness)
+        let gamma = max(0.1, min(4, cfg.gamma))
         let black = unit(cfg.blackPoint)
         var output = [UInt8](repeating: 0, count: n * 3)
         for z in 0..<n {
@@ -279,10 +307,35 @@ struct ColorPipeline {
                 let lift = 1 + unit(cfg.normalize) * 1.5 * t * t * (3 - 2 * t)
                 r = unit(r * lift); g = unit(g * lift); b = unit(b * lift)
             }
-            for (c, target) in [r, g, b].enumerated() {
-                smoothed[o + c] += (target - smoothed[o + c]) * alpha
-                let value = pow(unit(smoothed[o + c]), max(0.1, min(4, cfg.gamma))) * unit(cfg.brightness)
+
+            // A black target has no hue, so keep the last one: the afterglow
+            // fades in the colour of the flash instead of drifting to grey.
+            let peak = max(r, max(g, b))
+            if peak > 0.002 {
+                let target = [r / peak, g / peak, b / peak]
+                // Out of near-darkness there is no visible hue to blend from,
+                // so a flash lands in its own colour at once rather than
+                // passing through a whitish tint.
+                let a = level[z] < 0.02 ? 1 : alpha
+                for c in 0..<3 { chroma[o + c] += (target[c] - chroma[o + c]) * a }
+            }
+            let targetLevel = luma(r, g, b)
+            level[z] += (targetLevel - level[z]) * (targetLevel > level[z] ? attack : release)
+
+            // Recombine so the colour's luma equals the envelope. At rest this
+            // reproduces the target exactly; only transitions change.
+            let chromaLuma = luma(chroma[o], chroma[o + 1], chroma[o + 2])
+            let scale = chromaLuma > 0.0001 ? level[z] / chromaLuma : 0
+            for c in 0..<3 {
+                let value = pow(unit(chroma[o + c] * scale), gamma) * gain
                 output[o + c] = UInt8((unit(value) * 255).rounded())
+            }
+            // An exponential release never quite arrives. Once a fade toward
+            // black is below one 8-bit step, finish it, so the lamp is really
+            // off rather than lingering at an invisible 1/255 for seconds.
+            if targetLevel == 0, output[o..<o + 3].allSatisfy({ $0 <= 1 }) {
+                level[z] = 0
+                output[o] = 0; output[o + 1] = 0; output[o + 2] = 0
             }
         }
         return output
@@ -539,7 +592,7 @@ final class FrameHandler: NSObject, SCStreamOutput {
         let dt = lastOutputTime.map { max(0, started - $0) } ?? 1.0 / Double(max(1, cfg.fps))
         lastOutputTime = started
         var colors = pipeline.process(samples.colors, luminances: samples.luminances,
-                                      deltaTime: dt, snap: pendingCut)
+                                      deltaTime: dt, cut: pendingCut)
         pendingCut = false
         if cfg.audio {
             audioLock.lock()

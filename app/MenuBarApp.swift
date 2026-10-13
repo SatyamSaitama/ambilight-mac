@@ -63,6 +63,11 @@ private struct AppSettings: Codable {
     var saturation = 1.3
     var darkLift = 0.18
     var response = 0.12
+    /// How long brightness takes to fall after a flash. Optional so settings
+    /// saved by v1.1 still decode.
+    var afterglow: Double? = 0.6
+    /// Master brightness applied by the lamp instead of in software.
+    var lampDimming: Bool? = true
     var gamma = 1.6
     var audioDepth = 0.15
     var edgeDepth = 0.20
@@ -104,6 +109,11 @@ private struct AppSettings: Codable {
         c.layout = LightLayout(rawValue: layout) ?? .perimeter
         c.brightness = brightness; c.saturation = saturation; c.normalize = darkLift
         c.responseTime = mode == .ambient ? max(0.5, response) : response
+        // Brightness rises fast enough that a flash on screen lights the room
+        // at once, and falls over the afterglow. Ambient stays gentle both ways.
+        c.attackTime = mode == .ambient ? max(0.5, response) : min(response, 0.05)
+        c.releaseTime = mode == .ambient ? max(1.5, afterglow ?? 0.6) : (afterglow ?? 0.6)
+        c.hardwareBrightness = lampDimming ?? true
         c.gamma = gamma; c.audioDepth = audioDepth; c.audio = mode == .sound
         c.edgeDepth = edgeDepth; c.excludeSubtitles = excludeSubtitles; c.letterbox = letterbox
         c.bleRate = bleRate ?? 15
@@ -182,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cropFields: [NSTextField] = []
     private var subtitleToggle = NSButton(checkboxWithTitle: "Reduce subtitle influence near the bottom", target: nil, action: nil)
     private var letterboxToggle = NSButton(checkboxWithTitle: "Detect letterbox and pillarbox borders", target: nil, action: nil)
+    private var lampDimmingToggle = NSButton(checkboxWithTitle: "Let the lamp do the dimming (finer steps in dark scenes)", target: nil, action: nil)
     private var reverseLeftToggle = NSButton(checkboxWithTitle: "Reverse left bar", target: nil, action: nil)
     private var reverseRightToggle = NSButton(checkboxWithTitle: "Reverse right bar", target: nil, action: nil)
     private var swapToggle = NSButton(checkboxWithTitle: "Swap left and right outputs", target: nil, action: nil)
@@ -480,10 +491,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               sliderRow("saturation", title: "Saturation", value: settings.saturation, range: 0...2.5),
               sliderRow("darkLift", title: "Dark-scene lift", value: settings.darkLift, range: 0...0.6),
               sliderRow("response", title: "Response time", value: settings.response, range: 0.02...1.2),
+              sliderRow("afterglow", title: "Afterglow", value: settings.afterglow ?? 0.6, range: 0.05...2),
               sliderRow("gamma", title: "Gamma", value: settings.gamma, range: 0.6...3),
               sliderRow("audioDepth", title: "Audio depth", value: settings.audioDepth, range: 0...1),
               sliderRow("edgeDepth", title: "Edge depth", value: settings.edgeDepth, range: 0.05...0.4),
-              note("Start dim and increase to suit the room. Lower response time reacts faster. Audio depth applies to Sound + Movie; edge depth controls how far perimeter sampling reaches into the picture.")])
+              lampDimmingToggleConfigured(),
+              note("Start dim and increase to suit the room. Lower response time reacts faster. Afterglow sets how slowly the light fades after a bright moment; brightening stays instant. Audio depth applies to Sound + Movie; edge depth controls how far perimeter sampling reaches into the picture.")])
+    }
+    private func lampDimmingToggleConfigured() -> NSView {
+        lampDimmingToggle.state = (settings.lampDimming ?? true) ? .on : .off
+        lampDimmingToggle.target = self; lampDimmingToggle.action = #selector(toggleChanged)
+        return lampDimmingToggle
     }
     private func calibrationPane() -> NSView {
         gainFields = [settings.leftGain, settings.rightGain].map { $0.map { textField(String(format: "%.2f", $0)) } }
@@ -605,13 +623,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func cropChanged() { updateCropControls(); markPending() }
     private func updateCropControls() { cropFields.forEach { $0.isEnabled = cropToggle.state == .on } }
+    @objc private func toggleChanged() { markPending() }
     @objc private func sliderMoved(_ sender: NSSlider) {
         if let key = sender.identifier?.rawValue { updateSliderLabel(key) }; markPending()
     }
     private func updateSliderLabel(_ key: String) {
         guard let slider = sliders[key] else { return }
         switch key {
-        case "response": sliderLabels[key]?.stringValue = String(format: "%.0f ms", slider.doubleValue * 1000)
+        case "response", "afterglow": sliderLabels[key]?.stringValue = String(format: "%.0f ms", slider.doubleValue * 1000)
         case "brightness", "darkLift", "audioDepth", "edgeDepth": sliderLabels[key]?.stringValue = String(format: "%.0f%%", slider.doubleValue * 100)
         default: sliderLabels[key]?.stringValue = String(format: "%.2f", slider.doubleValue)
         }
@@ -619,10 +638,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func markPending() { resultLabel.stringValue = "Changes take effect when you choose Apply."; resultLabel.textColor = .secondaryLabelColor }
     @objc private func resetTuning() {
         let defaults = AppSettings()
-        for (key, value) in [("brightness", defaults.brightness), ("saturation", defaults.saturation), ("darkLift", defaults.darkLift), ("response", defaults.response), ("gamma", defaults.gamma), ("audioDepth", defaults.audioDepth), ("edgeDepth", defaults.edgeDepth)] {
+        for (key, value) in [("brightness", defaults.brightness), ("saturation", defaults.saturation), ("darkLift", defaults.darkLift), ("response", defaults.response), ("afterglow", defaults.afterglow ?? 0.6), ("gamma", defaults.gamma), ("audioDepth", defaults.audioDepth), ("edgeDepth", defaults.edgeDepth)] {
             sliders[key]?.doubleValue = value; updateSliderLabel(key)
         }
-        subtitleToggle.state = .on; letterboxToggle.state = .on; markPending()
+        subtitleToggle.state = .on; letterboxToggle.state = .on; lampDimmingToggle.state = .on; markPending()
     }
 
     // MARK: Validate and apply once
@@ -683,6 +702,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.darkLift = sliders["darkLift"]!.doubleValue; next.response = sliders["response"]!.doubleValue
         next.gamma = sliders["gamma"]!.doubleValue; next.audioDepth = sliders["audioDepth"]!.doubleValue
         next.edgeDepth = sliders["edgeDepth"]!.doubleValue
+        next.afterglow = sliders["afterglow"]!.doubleValue
+        next.lampDimming = lampDimmingToggle.state == .on
         next.excludeSubtitles = subtitleToggle.state == .on; next.letterbox = letterboxToggle.state == .on
         for index in 0..<2 {
             let values = gainFields[index].compactMap { Double($0.stringValue) }

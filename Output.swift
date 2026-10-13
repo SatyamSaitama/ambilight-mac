@@ -162,6 +162,10 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
     private var nextShotAt = 0.0
     private var shotCompletionAt: Double?
     private var needsPower = true
+    /// The lamp's own BRIGHTNESS, sent after power-on and after every wake, when
+    /// master dimming is done by the controller rather than in software.
+    private let hardwareLevel: UInt8?
+    private var needsLevel = true
     private var needsBlackout = false
     var stepDelay = 0.15
     var onOneShotComplete: (() -> Void)?
@@ -170,9 +174,11 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
     var isReady: Bool { characteristic != nil && !stopped }
 
     init(nameFilter: String, rate: Double, deadband: Int, oneShot: [Data] = [],
-         deviceID: UUID? = nil, onStatus: ((OutputStatus) -> Void)? = nil,
+         deviceID: UUID? = nil, hardwareLevel: UInt8? = nil,
+         onStatus: ((OutputStatus) -> Void)? = nil,
          onIdentified: ((UUID) -> Void)? = nil) {
         self.nameFilter = nameFilter; self.minInterval = 1 / max(1, rate); self.deadband = deadband
+        self.hardwareLevel = hardwareLevel
         self.oneShot = oneShot; self.deviceID = deviceID; self.onStatus = onStatus; self.onIdentified = onIdentified
         super.init()
         // All BLE state and callbacks are serialized on the main queue.
@@ -196,6 +202,8 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
     private func frame(_ colors: [UInt8]) -> Data { Data([0x7E,0x07,0x05,0x03] + colors + [0x10,0xEF]) }
     private let powerOn = Data([0x7E,0x07,0x04,0xFF,0x01,0x01,0x02,0x01,0xEF])
     private let powerOff = Data([0x7E,0x07,0x04,0x00,0x01,0x00,0x02,0x01,0xEF])
+    /// BRIGHTNESS uses a len byte of 4, not 7.
+    private func levelFrame(_ v: UInt8) -> Data { Data([0x7E,0x04,0x01,v,0xFF,0xFF,0xFF,0x00,0xEF]) }
     private func tick() {
         guard !stopped else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -205,7 +213,12 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
         }
         guard let p = peripheral, let ch = characteristic, p.canSendWriteWithoutResponse else { return }
         if suspended {
-            if needsBlackout { p.writeValue(powerOff, for: ch, type: .withoutResponse); needsBlackout = false }
+            if needsBlackout {
+                // Hand the lamp back at full brightness, so the remote and the
+                // phone app are not left stuck at our dimmed level.
+                if hardwareLevel != nil { p.writeValue(levelFrame(255), for: ch, type: .withoutResponse) }
+                p.writeValue(powerOff, for: ch, type: .withoutResponse); needsBlackout = false
+            }
             return
         }
         if !oneShot.isEmpty {
@@ -225,6 +238,11 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
             needsPower = false; lastWrite = now
             return
         }
+        if needsLevel, let level = hardwareLevel {
+            p.writeValue(levelFrame(level), for: ch, type: .withoutResponse)
+            needsLevel = false; lastWrite = now
+            return
+        }
         guard let colors = pending, now - lastWrite >= minInterval else { return }
         if let last = lastSent {
             let delta = zip(colors, last).map { abs(Int($0) - Int($1)) }.max() ?? 0
@@ -242,7 +260,7 @@ final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripher
     }
     func resume() {
         guard !stopped else { return }
-        suspended = false; needsBlackout = false; lastSent = nil; needsPower = true
+        suspended = false; needsBlackout = false; lastSent = nil; needsPower = true; needsLevel = true
         report(characteristic == nil ? "Reconnecting" : "Connected", detail: peripheral?.name ?? nameFilter, connected: characteristic != nil)
         tick()
     }
@@ -345,14 +363,16 @@ func makeColorSink(_ cfg: Config, onStatus: ((OutputStatus) -> Void)? = nil,
                                        writesPerSecond: statuses.reduce(0) { $0 + $1.writesPerSecond },
                                        connected: statuses.allSatisfy { $0.connected }))
             }
+            let level: UInt8? = cfg.hardwareBrightness ? UInt8((max(0, min(1, cfg.brightness)) * 255).rounded()) : nil
             let left = BLESender(nameFilter: name, rate: cfg.bleRate, deadband: cfg.bleDeadband, deviceID: cfg.bleID,
-                                 onStatus: { update(0, $0) }, onIdentified: onIdentified)
+                                 hardwareLevel: level, onStatus: { update(0, $0) }, onIdentified: onIdentified)
             let right = BLESender(nameFilter: name, rate: cfg.bleRate, deadband: cfg.bleDeadband, deviceID: rightID,
-                                  onStatus: { update(1, $0) })
+                                  hardwareLevel: level, onStatus: { update(1, $0) })
             return DualBLESender(left: left, right: right)
         }
         return BLESender(nameFilter: name, rate: cfg.bleRate, deadband: cfg.bleDeadband,
-                         deviceID: cfg.bleID, onStatus: onStatus, onIdentified: onIdentified)
+                         deviceID: cfg.bleID, hardwareLevel: cfg.hardwareBrightness ? UInt8((max(0, min(1, cfg.brightness)) * 255).rounded()) : nil,
+                         onStatus: onStatus, onIdentified: onIdentified)
     }
     guard let sink = WLEDSender(host: cfg.host, port: cfg.port, ledCount: cfg.ledCount, onStatus: onStatus) else {
         throw ConfigurationError("Could not resolve or open WLED target \(cfg.host)")

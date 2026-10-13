@@ -29,6 +29,8 @@ func validatedConfig(_ cfg: Config) throws -> Config {
     try require(inRange(cfg.regionHeight, 0.01...1), "Region height must be between 0.01 and 1")
     try require(inRange(cfg.edgeDepth, 0.05...0.5), "Edge depth must be between 0.05 and 0.5")
     try require(inRange(cfg.responseTime, 0...2), "Response time must be between 0 and 2000 milliseconds")
+    try require(inRange(cfg.attackTime, 0...2), "Brightness attack must be between 0 and 2000 milliseconds")
+    try require(inRange(cfg.releaseTime, 0...5), "Afterglow must be between 0 and 5000 milliseconds")
     try require(inRange(cfg.audioDepth, 0...1), "Audio response must be between 0 and 1")
     try require(inRange(cfg.bleRate, 1...30), "Bluetooth write rate must be between 1 and 30 per second")
     try require((0...255).contains(cfg.bleDeadband), "Bluetooth deadband must be between 0 and 255")
