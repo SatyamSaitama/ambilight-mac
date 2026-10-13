@@ -1,6 +1,14 @@
 # Xergy 270° movie immersion plan
 
-Researched 13 October 2026. Proposal only: no application source, running app, or light settings changed.
+Researched 13 October 2026. The proposal below records the original investigation; implementation status is recorded next.
+
+## Implementation status — v1.1
+
+Implemented the software phase for the confirmed shared-controller setup: native saved settings, source/window/crop selection, whole/perimeter sampling before colour correction, restrained Movie defaults, subtitle mask, dark-scene preservation, time-based response, live colour/status diagnostics, saved BLE IDs, reconnection/pacing, RGB calibration, and asynchronous shutdown. Two distinct BLE controllers can use left/right routing; compatible WLED hardware can use four regions with swapping and bar direction controls.
+
+No arbitrary segment command was verified for the stock shared controller. Separate colours on its two bars or halves remain an investigation, not an enabled stock feature. The app explicitly limits shared BLE to one live colour. No controller was cut, rewired, or purchased. Placement remains a physical adjustment for the user.
+
+Build and synthetic test results, interface verification, and output checks are documented in README.md and VALIDATION.md. Tests on real movie playback, physical lamp delay, HDR fidelity, and full-length sleep/wake endurance remain manual acceptance checks. The original findings and proposed phases follow.
 
 ## Recommendation
 

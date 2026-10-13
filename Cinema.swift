@@ -5,107 +5,353 @@ import CoreVideo
 import AppKit
 import AVFoundation
 
-// MARK: - Color pipeline
+// MARK: - Spatial layout
+
+enum LightLayout: String, CaseIterable {
+    case whole, perimeter, sides, four, columns
+
+    var title: String {
+        switch self {
+        case .whole: return "Whole picture"
+        case .perimeter: return "Picture edges"
+        case .sides: return "Left and right bars"
+        case .four: return "Four bar segments"
+        case .columns: return "Horizontal strip"
+        }
+    }
+    var labels: [String] {
+        switch self {
+        case .whole: return ["Whole picture"]
+        case .perimeter: return ["Picture edges"]
+        case .sides: return ["Left", "Right"]
+        case .four: return ["Left top", "Left bottom", "Right top", "Right bottom"]
+        case .columns: return ["Columns"]
+        }
+    }
+    func zoneCount(ledCount: Int) -> Int {
+        switch self {
+        case .whole, .perimeter: return 1
+        case .sides: return 2
+        case .four: return 4
+        case .columns: return max(1, ledCount)
+        }
+    }
+}
+
+struct FramePreview {
+    let colors: [UInt8]
+    let labels: [String]
+    let captureFPS: Double
+    let processingMS: Double
+    /// Active picture bounds within the selected capture source, normalized to 0...1.
+    let pictureRect: CGRect
+}
+
+struct ZoneSamples {
+    let colors: [Double]
+    /// Unweighted luma preserves scene darkness even when chroma is emphasized.
+    let luminances: [Double]
+    let pictureRect: CGRect
+}
+
+private let fullPicture = CGRect(x: 0, y: 0, width: 1, height: 1)
+private func unit(_ x: Double) -> Double { x.isFinite ? max(0, min(1, x)) : 0 }
+private func luma(_ r: Double, _ g: Double, _ b: Double) -> Double {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+private func safePicture(_ rect: CGRect?) -> CGRect {
+    guard let r = rect, !r.isNull, !r.isInfinite,
+          r.origin.x.isFinite, r.origin.y.isFinite,
+          r.width.isFinite, r.height.isFinite else { return fullPicture }
+    let clipped = r.intersection(fullPicture)
+    return clipped.isNull || clipped.width <= 0 || clipped.height <= 0 ? fullPicture : clipped
+}
+
+/// Array adapter for synthetic-image tests and offline analysis; capture uses the pointer overload.
+func sampleLightZones(bgra: [UInt8], width: Int, height: Int,
+                      bytesPerRow: Int? = nil, pictureRect: CGRect? = nil,
+                      cfg: Config) -> ZoneSamples {
+    let stride = bytesPerRow ?? max(0, width) * 4
+    guard width > 0, height > 0, stride >= width * 4,
+          bgra.count / stride >= height else {
+        let count = cfg.layout.zoneCount(ledCount: cfg.ledCount)
+        return ZoneSamples(colors: Array(repeating: 0, count: count * 3),
+                           luminances: Array(repeating: 0, count: count), pictureRect: fullPicture)
+    }
+    return bgra.withUnsafeBufferPointer {
+        sampleLightZones($0.baseAddress!, width: width, height: height,
+                         bytesPerRow: stride, pictureRect: pictureRect ?? cfg.cropRect, cfg: cfg)
+    }
+}
+
+private func sampleLightZones(_ bytes: UnsafePointer<UInt8>, width: Int, height: Int,
+                              bytesPerRow: Int, pictureRect: CGRect?, cfg: Config) -> ZoneSamples {
+    let rect = safePicture(pictureRect)
+    let x0 = max(0, min(width - 1, Int((rect.minX * Double(width)).rounded())))
+    let y0 = max(0, min(height - 1, Int((rect.minY * Double(height)).rounded())))
+    let x1 = max(x0 + 1, min(width, Int((rect.maxX * Double(width)).rounded())))
+    let y1 = max(y0 + 1, min(height, Int((rect.maxY * Double(height)).rounded())))
+    let count = cfg.layout.zoneCount(ledCount: cfg.ledCount)
+    var sums = [Double](repeating: 0, count: count * 3)
+    var weights = [Double](repeating: 0, count: count)
+    var brightness = [Double](repeating: 0, count: count)
+    var pixels = [Int](repeating: 0, count: count)
+    let depth = max(0.05, min(0.5, cfg.edgeDepth))
+    for y in y0..<y1 {
+        let ny = (Double(y - y0) + 0.5) / Double(y1 - y0)
+        for x in x0..<x1 {
+            let nx = (Double(x - x0) + 0.5) / Double(x1 - x0)
+            // A configurable geometric mask, not text recognition. Side edges remain sampled.
+            if cfg.excludeSubtitles && ny >= 0.80 && nx >= 0.20 && nx <= 0.80 { continue }
+            let zone: Int
+            switch cfg.layout {
+            case .whole: zone = 0
+            case .perimeter:
+                guard nx < depth || nx >= 1 - depth || ny < depth || ny >= 1 - depth else { continue }
+                zone = 0
+            case .sides, .four:
+                guard nx < depth || nx >= 1 - depth else { continue }
+                let side = nx < depth ? 0 : 1
+                zone = cfg.layout == .four ? side * 2 + (ny < 0.5 ? 0 : 1) : side
+            case .columns:
+                guard ny <= max(0.01, min(1, cfg.regionHeight)) else { continue }
+                zone = min(count - 1, Int(nx * Double(count)))
+            }
+            let p = bytes + y * bytesPerRow + x * 4
+            let r = Double(p[2]) / 255, g = Double(p[1]) / 255, b = Double(p[0]) / 255
+            let weight = chromaWeight(r * 255, g * 255, b * 255, unit(cfg.vividness))
+            sums[zone * 3] += r * weight
+            sums[zone * 3 + 1] += g * weight
+            sums[zone * 3 + 2] += b * weight
+            weights[zone] += weight
+            brightness[zone] += luma(r, g, b)
+            pixels[zone] += 1
+        }
+    }
+    for z in 0..<count where pixels[z] > 0 {
+        brightness[z] /= Double(pixels[z])
+        for channel in 0..<3 { sums[z * 3 + channel] /= weights[z] }
+        let weightedLuma = luma(sums[z * 3], sums[z * 3 + 1], sums[z * 3 + 2])
+        // A tiny colorful highlight can choose the hue, but cannot illuminate a dark room.
+        let limit = brightness[z] * 1.15
+        if weightedLuma > limit && weightedLuma > 0 {
+            for channel in 0..<3 { sums[z * 3 + channel] *= limit / weightedLuma }
+        }
+    }
+    // A user can deliberately select a narrow crop or more strip LEDs than
+    // analysis pixels. Interpolate missing column bins instead of inventing
+    // black pixels between valid samples.
+    if cfg.layout == .columns {
+        let populated = (0..<count).filter { pixels[$0] > 0 }
+        if !populated.isEmpty {
+            var next = 0
+            for z in 0..<count where pixels[z] == 0 {
+                while next < populated.count - 1 && populated[next] < z { next += 1 }
+                let right = populated[next]
+                let left = right > z && next > 0 ? populated[next - 1] : right
+                let blend = left == right ? 0 : unit(Double(z - left) / Double(right - left))
+                for channel in 0..<3 {
+                    sums[z * 3 + channel] = sums[left * 3 + channel] * (1 - blend)
+                        + sums[right * 3 + channel] * blend
+                }
+                brightness[z] = brightness[left] * (1 - blend) + brightness[right] * blend
+            }
+        }
+    }
+    return ZoneSamples(colors: sums, luminances: brightness, pictureRect: rect)
+}
+
+private func orderedZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
+    guard colors.count >= cfg.layout.zoneCount(ledCount: cfg.ledCount) * 3 else { return [] }
+    var order = Array(0..<(colors.count / 3))
+    if cfg.layout == .sides {
+        if cfg.swapSides { order = [1, 0] }
+    } else if cfg.layout == .four {
+        order = cfg.swapSides ? [2, 3, 0, 1] : [0, 1, 2, 3]
+        if cfg.reverseLeft { order.swapAt(0, 1) }
+        if cfg.reverseRight { order.swapAt(2, 3) }
+    }
+    return order.flatMap { Array(colors[($0 * 3)..<($0 * 3 + 3)]) }
+}
+
+private func calibrated(_ rgb: ArraySlice<UInt8>, gain: [Double]) -> [UInt8] {
+    rgb.enumerated().map { channel, byte in
+        let g = gain.indices.contains(channel) && gain[channel].isFinite ? max(0, gain[channel]) : 1
+        return UInt8(max(0, min(255, (Double(byte) * g).rounded())))
+    }
+}
+
+func previewZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
+    let ordered = orderedZones(colors, cfg: cfg)
+    var result = [UInt8]()
+    let n = ordered.count / 3
+    for z in 0..<n {
+        let right = (cfg.layout == .sides && z == 1) || (cfg.layout == .four && z >= 2)
+            || (cfg.layout == .columns && z >= (n + 1) / 2)
+        result += calibrated(ordered[z * 3..<z * 3 + 3], gain: right ? cfg.rightGain : cfg.leftGain)
+    }
+    return result
+}
+
+/// Physical layout: left bar first, then right, each top-to-bottom. Odd counts give
+/// the left bar the extra LED; an odd bar gives its upper segment the extra LED.
+/// BLE receives one/two logical colors; its validated transport never averages them.
+func expandLightZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
+    let zones = orderedZones(colors, cfg: cfg)
+    guard !zones.isEmpty else { return [] }
+    if cfg.bleName != nil { return previewZones(colors, cfg: cfg) }
+    let n = max(1, cfg.ledCount), leftCount = (n + 1) / 2
+    var result = [UInt8]()
+    result.reserveCapacity(n * 3)
+    for pixel in 0..<n {
+        let right = pixel >= leftCount
+        let count = right ? n - leftCount : leftCount
+        let local = right ? pixel - leftCount : pixel
+        // Reverse the physical LED order, rather than swapping equal-size halves.
+        let reverse = right ? cfg.reverseRight : cfg.reverseLeft
+        let position = reverse ? count - 1 - local : local
+        let zone: Int
+        switch cfg.layout {
+        case .whole, .perimeter: zone = 0
+        case .sides: zone = right ? 1 : 0
+        case .four:
+            // orderedZones applied reversals for previews; use the unreversed source here
+            // so a 3-pixel bar reverses [top,top,bottom] to [bottom,top,top].
+            let sourceSide = cfg.swapSides ? (right ? 0 : 1) : (right ? 1 : 0)
+            let sourceZone = sourceSide * 2 + (position < (count + 1) / 2 ? 0 : 1)
+            result += calibrated(colors[sourceZone * 3..<sourceZone * 3 + 3],
+                                 gain: right ? cfg.rightGain : cfg.leftGain)
+            continue
+        case .columns: zone = min(pixel, zones.count / 3 - 1)
+        }
+        result += calibrated(zones[zone * 3..<zone * 3 + 3], gain: right ? cfg.rightGain : cfg.leftGain)
+    }
+    return result
+}
+
+// MARK: - Time-based cinematic color processing
 
 struct ColorPipeline {
     let cfg: Config
-    private var smoothed: [Double]
-    private let gammaLUT: [UInt8]
+    private var smoothed: [Double] = []
+    private var dark: [Bool] = []
 
-    init(cfg: Config) {
-        self.cfg = cfg
-        smoothed = [Double](repeating: 0, count: cfg.ledCount * 3)
-        // Precompute gamma + brightness so the hot path is a table lookup.
-        gammaLUT = (0...255).map { i in
-            let v = pow(Double(i) / 255.0, cfg.gamma) * cfg.brightness
-            return UInt8(max(0, min(255, (v * 255.0).rounded())))
+    init(cfg: Config) { self.cfg = cfg }
+
+    /// Samples are normalized capture RGB, not assumed linear-light values. Gamma
+    /// is a calibrated output transfer; chroma reduction happens before this stage.
+    mutating func process(_ raw: [Double], luminances: [Double]? = nil,
+                          deltaTime: Double = 1.0 / 60.0, snap: Bool = false) -> [UInt8] {
+        let n = raw.count / 3
+        guard n > 0 else { return [] }
+        if smoothed.count != n * 3 {
+            smoothed = Array(repeating: 0, count: n * 3)
+            dark = Array(repeating: false, count: n)
         }
-    }
-
-    /// raw: ledCount linear RGB triplets in 0...1
-    mutating func process(_ raw: [Double], snap: Bool = false) -> [UInt8] {
-        var out = [UInt8](repeating: 0, count: cfg.ledCount * 3)
-        let a = snap ? 1.0 : cfg.smoothing
-
-        for led in 0..<cfg.ledCount {
-            let o = led * 3
-            var r = raw[o], g = raw[o + 1], b = raw[o + 2]
-
-            // Saturation boost around luma — screen averages are washed out
-            // because averaging pulls everything toward grey.
-            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            if luma < cfg.blackPoint {
+        let dt = deltaTime.isFinite ? max(0, min(2, deltaTime)) : 1.0 / 60.0
+        var tau = max(0.001, cfg.responseTime)
+        // Preserve the meaning of explicit legacy smoothing at a 60 Hz reference.
+        if cfg.explicit.contains("--smoothing") {
+            let alpha = max(0.0001, min(0.9999, cfg.smoothing))
+            tau = -(1.0 / 60.0) / log(1 - alpha)
+        }
+        let alpha = snap || (cfg.responseTime == 0 && !cfg.explicit.contains("--smoothing")) ? 1 : 1 - exp(-dt / tau)
+        let black = unit(cfg.blackPoint)
+        var output = [UInt8](repeating: 0, count: n * 3)
+        for z in 0..<n {
+            let o = z * 3
+            var r = unit(raw[o]), g = unit(raw[o + 1]), b = unit(raw[o + 2])
+            let colorLuma = luma(r, g, b)
+            let sceneLuma = luminances?.indices.contains(z) == true ? unit(luminances![z]) : colorLuma
+            // Separate enter/exit thresholds prevent flicker around black.
+            if dark[z] {
+                if sceneLuma > black * 1.15 { dark[z] = false }
+            } else if sceneLuma <= black * 0.65 { dark[z] = true }
+            if dark[z] {
                 r = 0; g = 0; b = 0
             } else {
-                r = max(0, min(1, luma + (r - luma) * cfg.saturation))
-                g = max(0, min(1, luma + (g - luma) * cfg.saturation))
-                b = max(0, min(1, luma + (b - luma) * cfg.saturation))
+                let sat = max(0, min(3, cfg.saturation))
+                r = unit(colorLuma + (r - colorLuma) * sat)
+                g = unit(colorLuma + (g - colorLuma) * sat)
+                b = unit(colorLuma + (b - colorLuma) * sat)
+                // Bounded gain fades away in dark scenes. No normalization to full scale.
+                let t = unit((sceneLuma - black) / max(0.01, 0.35 - black))
+                let lift = 1 + unit(cfg.normalize) * 1.5 * t * t * (3 - 2 * t)
+                r = unit(r * lift); g = unit(g * lift); b = unit(b * lift)
             }
-
-            // Scale the color up until its brightest channel saturates,
-            // then blend back toward the original by `normalize`. Hue and
-            // relative channel ratios are preserved; only level changes.
-            if cfg.normalize > 0 {
-                let peak = max(r, max(g, b))
-                if peak > 0.02 {
-                    let k = 1.0 / peak
-                    r += (r * k - r) * cfg.normalize
-                    g += (g * k - g) * cfg.normalize
-                    b += (b * k - b) * cfg.normalize
-                }
+            for (c, target) in [r, g, b].enumerated() {
+                smoothed[o + c] += (target - smoothed[o + c]) * alpha
+                let value = pow(unit(smoothed[o + c]), max(0.1, min(4, cfg.gamma))) * unit(cfg.brightness)
+                output[o + c] = UInt8((unit(value) * 255).rounded())
             }
-
-            smoothed[o]     += (r - smoothed[o])     * a
-            smoothed[o + 1] += (g - smoothed[o + 1]) * a
-            smoothed[o + 2] += (b - smoothed[o + 2]) * a
-
-            out[o]     = gammaLUT[Int(max(0, min(255, (smoothed[o]     * 255).rounded())))]
-            out[o + 1] = gammaLUT[Int(max(0, min(255, (smoothed[o + 1] * 255).rounded())))]
-            out[o + 2] = gammaLUT[Int(max(0, min(255, (smoothed[o + 2] * 255).rounded())))]
         }
-        return out
+        return output
+    }
+}
+
+// MARK: - Picture-bound stability
+
+/// Retain useful bounds through dark fades. New crops must persist; revealing
+/// more image expands immediately. Dark startup retains the full source.
+struct PictureBoundsTracker {
+    private(set) var rect = fullPicture
+    private var candidate = fullPicture
+    private var candidateSeconds = 0.0
+
+    mutating func update(detected: CGRect, frameLuma: Double, deltaTime: Double) -> CGRect {
+        let d = safePicture(detected)
+        guard frameLuma > 0.025, d.width >= 0.35, d.height >= 0.35 else { return rect }
+        // Automatic bars are expected to be approximately centered. An arbitrary
+        // off-center player should use the source/window selector instead.
+        guard abs(d.minX - (1 - d.maxX)) <= 0.05,
+              abs(d.minY - (1 - d.maxY)) <= 0.05 else { return rect }
+        let grown = CGRect(x: min(rect.minX, d.minX), y: min(rect.minY, d.minY),
+                           width: max(rect.maxX, d.maxX) - min(rect.minX, d.minX),
+                           height: max(rect.maxY, d.maxY) - min(rect.minY, d.minY))
+        rect = grown
+        let change = abs(d.minX - candidate.minX) + abs(d.minY - candidate.minY)
+            + abs(d.maxX - candidate.maxX) + abs(d.maxY - candidate.maxY)
+        if change < 0.025 {
+            candidateSeconds += max(0, min(0.2, deltaTime))
+        } else {
+            candidate = d
+            candidateSeconds = 0
+        }
+        if candidateSeconds >= 0.7 { rect = d }
+        return rect
     }
 }
 
 // MARK: - Capture
 
 final class FrameHandler: NSObject, SCStreamOutput {
+    /// Pixel callbacks, audio callbacks, and output ticks share this queue.
+    let sampleQueue = DispatchQueue(label: "ambilight.frames")
     private let cfg: Config
     private let sink: ColorSink
     private var pipeline: ColorPipeline
-    private var frames = 0
-    private var lastReport = Date()
-
-    // Audio level, written on the audio queue and read on the video queue.
+    private var bounds = PictureBoundsTracker()
     private var prevRaw: [Double]?
+    private var lastFrameTime: Double?
+    private var lastOutputTime: Double?
+    private var latestSamples: ZoneSamples?
+    private var pendingCut = false
+    private var samplingMS = 0.0
+    private var outputTimer: DispatchSourceTimer?
+    private var stopped = false
+    private var lastPreviewTime = 0.0
+    private var reportTime = ProcessInfo.processInfo.systemUptime
+    private var reportFrames = 0
+    private var measuredFPS = 0.0
     private let audioLock = NSLock()
     private var audioLevel = 0.0
     private var audioPeak = 0.02
-    private var audioBuffers = 0
     private var audioFails = 0
-    private var audioSamples = 0
-    private var audioRawMax = 0.0
-    private var audioStatus = 0
-    private var audioNeeded = 0
+    private var lastAudioTime = 0.0
+    var onPreview: ((FramePreview) -> Void)?
 
-    /// Stable picture bounds. They expand instantly and contract slowly, so a
-    /// dark scene is never mistaken for a wider black bar -- bars are
-    /// permanent, dark scenes are not.
-    private var sTop = 0.0, sBot = 0.0, sLeft = 0.0, sRight = 0.0
-    private var boundsReady = false
-    private let barLevel = 12      // channel value still counted as "black bar"
-    private let contract = 0.005   // ~3s to give picture area back
-
-    /// Horizontal samples per LED. More than 1 smooths out single-pixel noise.
-    private let samplesPerLED = 4
-
-    var captureWidth: Int { min(960, cfg.ledCount * samplesPerLED) }
-
-    /// Set once the display is known. The capture MUST match the display's
-    /// aspect ratio: ScreenCaptureKit letterboxes a mismatched frame, and those
-    /// black bars land on the first and last zones, leaving both ends of the
-    /// strip permanently dark.
-    var captureHeight: Int = 32
+    var captureWidth: Int { max(64, min(960, cfg.analysisWidth)) }
+    var captureHeight: Int = 108
 
     init(cfg: Config, sink: ColorSink) {
         self.cfg = cfg
@@ -113,242 +359,218 @@ final class FrameHandler: NSObject, SCStreamOutput {
         self.pipeline = ColorPipeline(cfg: cfg)
     }
 
+    deinit { outputTimer?.cancel() }
 
-    /// True when every sampled pixel in the row is dark enough to be a bar.
-    private func rowIsBar(_ b: UnsafePointer<UInt8>, _ y: Int, _ w: Int, _ st: Int) -> Bool {
-        let row = b + y * st
-        var x = 0
-        while x < w {
-            let p = row + x * 4
-            if Int(p[0]) > barLevel || Int(p[1]) > barLevel || Int(p[2]) > barLevel {
-                return false
-            }
-            x += 2
+    /// Continue the response and audio envelope even when capture reports no
+    /// changed pixels. Capturing a static frame is not a reason to freeze halfway
+    /// through a fade or leave a previous shot's color glowing on a black screen.
+    func start() {
+        sampleQueue.async { [weak self] in
+            guard let self, !self.stopped, self.outputTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.sampleQueue)
+            let interval = 1.0 / Double(max(1, self.cfg.fps))
+            timer.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(1))
+            timer.setEventHandler { [weak self] in self?.emitLatest() }
+            self.outputTimer = timer
+            timer.resume()
         }
-        return true
     }
 
-    private func colIsBar(_ b: UnsafePointer<UInt8>, _ x: Int, _ h: Int, _ st: Int) -> Bool {
-        var y = 0
-        while y < h {
-            let p = b + y * st + x * 4
-            if Int(p[0]) > barLevel || Int(p[1]) > barLevel || Int(p[2]) > barLevel {
-                return false
-            }
-            y += 2
+    func stop() {
+        sampleQueue.async { [weak self] in
+            guard let self else { return }
+            self.stopped = true
+            self.outputTimer?.cancel()
+            self.outputTimer = nil
+            self.latestSamples = nil
         }
-        return true
     }
 
-    /// Picture bounds for this frame, inset past any black bars.
+    /// Feed already-reduced samples from an offline or synthetic source. This
+    /// follows the same serialized output path as a captured video frame.
+    func submitSamples(_ samples: ZoneSamples) {
+        sampleQueue.async { [weak self] in self?.acceptSamples(samples) }
+    }
+
+    private func acceptSamples(_ samples: ZoneSamples) {
+        guard !stopped, !samples.colors.isEmpty else { return }
+        if let previous = prevRaw, previous.count == samples.colors.count {
+            let difference = zip(previous, samples.colors).reduce(0.0) { $0 + abs($1.0 - $1.1) }
+            pendingCut = pendingCut || difference / Double(previous.count) > cfg.cutThreshold
+        }
+        prevRaw = samples.colors
+        latestSamples = samples
+    }
+
+    /// Literal candidate detector, kept separately from temporal acceptance so
+    /// synthetic tests can distinguish a dark scene from genuine letterboxing.
     func detectBars(_ b: UnsafePointer<UInt8>, _ w: Int, _ h: Int, _ st: Int)
         -> (Int, Int, Int, Int) {
-        var top = 0, bot = h - 1, left = 0, right = w - 1
-        while top < h / 2 && rowIsBar(b, top, w, st) { top += 1 }
-        while bot > h / 2 && rowIsBar(b, bot, w, st) { bot -= 1 }
-        while left < w / 2 && colIsBar(b, left, h, st) { left += 1 }
-        while right > w / 2 && colIsBar(b, right, h, st) { right -= 1 }
-        return (top, bot, left, right)
+        guard w > 0, h > 0 else { return (0, 0, 0, 0) }
+        func isBarRow(_ y: Int) -> Bool {
+            var bright = 0, count = 0
+            for x in stride(from: 0, to: w, by: 2) {
+                // Ignore central subtitle glyphs while measuring lower black bars.
+                if cfg.excludeSubtitles && y >= h * 4 / 5 && x >= w / 5 && x <= w * 4 / 5 { continue }
+                let p = b + y * st + x * 4
+                if max(p[0], max(p[1], p[2])) > 12 { bright += 1 }
+                count += 1
+            }
+            return count > 0 && Double(bright) / Double(count) <= 0.015
+        }
+        func isBarColumn(_ x: Int) -> Bool {
+            var bright = 0, count = 0
+            for y in stride(from: 0, to: h, by: 2) {
+                let p = b + y * st + x * 4
+                if max(p[0], max(p[1], p[2])) > 12 { bright += 1 }
+                count += 1
+            }
+            return count > 0 && Double(bright) / Double(count) <= 0.015
+        }
+        var top = 0, bottom = h - 1, left = 0, right = w - 1
+        while top < h / 2 && isBarRow(top) { top += 1 }
+        while bottom > h / 2 && isBarRow(bottom) { bottom -= 1 }
+        while left < w / 2 && isBarColumn(left) { left += 1 }
+        while right > w / 2 && isBarColumn(right) { right -= 1 }
+        return (top, bottom, left, right)
     }
 
-
-    /// RMS of a system-audio block, normalised against a slowly decaying peak
-    /// so quiet passages still modulate rather than sitting at zero.
     private func handleAudio(_ sb: CMSampleBuffer) {
-        guard CMSampleBufferIsValid(sb) else { audioFails += 1; return }
-        audioBuffers += 1
-
-        // Two-call pattern: ask how big the list needs to be, then allocate
-        // exactly that. Guessing the size fails with ArrayTooSmall (-12737),
-        // and every sample is then silently discarded.
+        guard CMSampleBufferIsValid(sb),
+              let description = CMSampleBufferGetFormatDescription(sb),
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+              format.pointee.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              format.pointee.mBitsPerChannel == 32 else { return }
         var sizeNeeded = 0
-        var probe = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb,
-            bufferListSizeNeededOut: &sizeNeeded,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: nil)
-        audioNeeded = sizeNeeded
-        guard probe == noErr, sizeNeeded > 0 else {
-            audioStatus = Int(probe); audioFails += 1; return
-        }
-
+        _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sb, bufferListSizeNeededOut: &sizeNeeded, bufferListOut: nil, bufferListSize: 0,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+        guard sizeNeeded > 0 else { return }
         let raw = UnsafeMutableRawPointer.allocate(byteCount: sizeNeeded, alignment: 16)
         raw.initializeMemory(as: UInt8.self, repeating: 0, count: sizeNeeded)
         defer { raw.deallocate() }
-        let ablPtr = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
-
+        let abl = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
         var block: CMBlockBuffer?
-        probe = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: ablPtr,
-            bufferListSize: sizeNeeded,
-            blockBufferAllocator: kCFAllocatorDefault,
-            blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            blockBufferOut: &block)
-        let status = probe
-        audioStatus = Int(status)
-        guard status == noErr else { audioFails += 1; return }
-
-        var sum = 0.0
-        var count = 0
-        for buf in UnsafeMutableAudioBufferListPointer(ablPtr) {
-            guard let data = buf.mData else { continue }
-            let n = Int(buf.mDataByteSize) / MemoryLayout<Float32>.size
-            let p = data.assumingMemoryBound(to: Float32.self)
-            var i = 0
-            while i < n {
-                let v = Double(p[i])
-                sum += v * v
-                i += 2            // every other sample is plenty for an envelope
-                count += 1
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sb, bufferListSizeNeededOut: nil, bufferListOut: abl, bufferListSize: sizeNeeded,
+            blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, blockBufferOut: &block)
+        guard status == noErr else {
+            audioLock.lock(); audioFails += 1; audioLock.unlock(); return
+        }
+        var sum = 0.0, count = 0
+        for buffer in UnsafeMutableAudioBufferListPointer(abl) {
+            guard let data = buffer.mData else { continue }
+            let values = data.assumingMemoryBound(to: Float32.self)
+            for i in stride(from: 0, to: Int(buffer.mDataByteSize) / 4, by: 2) {
+                let value = Double(values[i])
+                if value.isFinite { sum += value * value; count += 1 }
             }
         }
-        guard count > 0 else { audioFails += 1; return }
+        guard count > 0 else { return }
         let rms = (sum / Double(count)).squareRoot()
-        audioSamples = count
-        if rms > audioRawMax { audioRawMax = rms }
-
+        let now = ProcessInfo.processInfo.systemUptime
         audioLock.lock()
-        audioPeak = max(rms, audioPeak * 0.9992)          // slow decay
-        let lvl = min(1.0, rms / max(audioPeak, 0.004))
-        // Attack fast, release slow -- a light that drops instantly on every
-        // gap between words reads as flicker.
-        let a = lvl > audioLevel ? 0.5 : 0.04
-        audioLevel += (lvl - audioLevel) * a
+        let dt = lastAudioTime > 0 ? max(0, min(0.5, now - lastAudioTime)) : 0.01
+        audioPeak = max(rms, audioPeak * exp(-dt / 12))
+        let level = min(1, rms / max(audioPeak, 0.004))
+        audioLevel += (level - audioLevel) * (1 - exp(-dt / (level > audioLevel ? 0.03 : 0.25)))
+        lastAudioTime = now
         audioLock.unlock()
     }
 
-    func stream(_ stream: SCStream,
-                didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        if type == .audio {
-            handleAudio(sampleBuffer)
-            return
-        }
-        guard type == .screen,
-              CMSampleBufferIsValid(sampleBuffer),
+        guard !stopped else { return }
+        if type == .audio { handleAudio(sampleBuffer); return }
+        guard type == .screen, CMSampleBufferIsValid(sampleBuffer),
               let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+            as? [[SCStreamFrameInfo: Any]],
+           let status = attachments.first?[.status] as? Int,
+           status != SCFrameStatus.complete.rawValue { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        let dt = lastFrameTime.map { max(0, started - $0) } ?? 1.0 / Double(max(1, cfg.fps))
+        lastFrameTime = started
         CVPixelBufferLockBaseAddress(px, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
-
         guard let base = CVPixelBufferGetBaseAddress(px) else { return }
-        let w = CVPixelBufferGetWidth(px)
-        let h = CVPixelBufferGetHeight(px)
-        let stride = CVPixelBufferGetBytesPerRow(px)
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px)
+        let rowBytes = CVPixelBufferGetBytesPerRow(px)
+        guard w > 0, h > 0 else { return }
         let bytes = base.assumingMemoryBound(to: UInt8.self)
-
-        // Picture area: the whole frame, or just the part inside the bars.
-        var top = 0, bot = h - 1, left = 0, right = w - 1
+        let crop = safePicture(cfg.cropRect)
+        let cropX = max(0, min(w - 1, Int(crop.minX * Double(w))))
+        let cropY = max(0, min(h - 1, Int(crop.minY * Double(h))))
+        let cropW = max(1, min(w - cropX, Int(crop.width * Double(w))))
+        let cropH = max(1, min(h - cropY, Int(crop.height * Double(h))))
+        let sourceRect = CGRect(x: Double(cropX) / Double(w), y: Double(cropY) / Double(h),
+                                width: Double(cropW) / Double(w), height: Double(cropH) / Double(h))
+        let croppedBytes = bytes + cropY * rowBytes + cropX * 4
+        var localPicture = fullPicture
         if cfg.letterbox {
-            let (dt, db, dl, dr) = detectBars(bytes, w, h, stride)
-            // A frame that is almost entirely dark is a dark scene, not a bar
-            // layout -- ignore it and keep whatever bounds we had.
-            let plausible = (db - dt) > h / 5 && (dr - dl) > w / 5
-            if !boundsReady {
-                (sTop, sBot, sLeft, sRight) = (Double(dt), Double(db), Double(dl), Double(dr))
-                boundsReady = true
-            } else if plausible {
-                // Grow at once, give area back slowly.
-                sTop   = dt <= Int(sTop)   ? Double(dt) : sTop + (Double(dt) - sTop) * contract
-                sBot   = db >= Int(sBot)   ? Double(db) : sBot + (Double(db) - sBot) * contract
-                sLeft  = dl <= Int(sLeft)  ? Double(dl) : sLeft + (Double(dl) - sLeft) * contract
-                sRight = dr >= Int(sRight) ? Double(dr) : sRight + (Double(dr) - sRight) * contract
-            }
-            top = max(0, Int(sTop)); bot = min(h - 1, Int(sBot))
-            left = max(0, Int(sLeft)); right = min(w - 1, Int(sRight))
-            if bot <= top { top = 0; bot = h - 1 }
-            if right <= left { left = 0; right = w - 1 }
-        }
-
-        let contentH = bot - top + 1
-        let contentW = right - left + 1
-
-        // Only the top `regionHeight` slice of the picture drives the LEDs.
-        let rows = max(1, Int(Double(contentH) * cfg.regionHeight))
-        var raw = [Double](repeating: 0, count: cfg.ledCount * 3)
-
-        for led in 0..<cfg.ledCount {
-            let x0 = left + led * contentW / cfg.ledCount
-            let x1 = max(x0 + 1, left + (led + 1) * contentW / cfg.ledCount)
-            var rs = 0.0, gs = 0.0, bs = 0.0
-            var wsum = 0.0
-
-            for y in top..<min(top + rows, h) {
-                let row = bytes + y * stride
-                for x in x0..<min(x1, w) {
-                    let p = row + x * 4          // BGRA
-                    let b = Double(p[0]), g = Double(p[1]), r = Double(p[2])
-
-                    // Weight each pixel by how colourful it is. A flat mean is
-                    // dominated by grey UI and dark background, which is what
-                    // makes averaged screen colour look muddy; this lets the
-                    // few saturated pixels that define a shot actually carry it.
-                    let wgt = chromaWeight(r, g, b, cfg.vividness)
-
-                    rs += r * wgt; gs += g * wgt; bs += b * wgt
-                    wsum += wgt
+            let (t, b, l, r) = detectBars(croppedBytes, cropW, cropH, rowBytes)
+            let candidate = CGRect(x: Double(l) / Double(cropW), y: Double(t) / Double(cropH),
+                                   width: Double(r - l + 1) / Double(cropW), height: Double(b - t + 1) / Double(cropH))
+            var frameLuma = 0.0, count = 0
+            for y in stride(from: 0, to: cropH, by: 4) {
+                for x in stride(from: 0, to: cropW, by: 4) {
+                    let p = croppedBytes + y * rowBytes + x * 4
+                    frameLuma += luma(Double(p[2]), Double(p[1]), Double(p[0])) / 255
+                    count += 1
                 }
             }
-            guard wsum > 0 else { continue }
-            let d = wsum * 255.0
-            let o = led * 3
-            raw[o] = rs / d; raw[o + 1] = gs / d; raw[o + 2] = bs / d
+            localPicture = bounds.update(detected: candidate, frameLuma: frameLuma / Double(max(1, count)), deltaTime: dt)
         }
+        let picture = CGRect(x: sourceRect.minX + localPicture.minX * sourceRect.width,
+                             y: sourceRect.minY + localPicture.minY * sourceRect.height,
+                             width: localPicture.width * sourceRect.width,
+                             height: localPicture.height * sourceRect.height)
+        let samples = sampleLightZones(bytes, width: w, height: h, bytesPerRow: rowBytes,
+                                       pictureRect: picture, cfg: cfg)
+        acceptSamples(samples)
+        samplingMS = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        reportFrames += 1
+    }
 
-        // A hard cut moves every zone at once. Sliding into the new colour
-        // would spend half a second showing a blend that appears in neither
-        // shot, so on a cut we snap and let smoothing resume after.
-        var cut = false
-        if let prev = prevRaw, prev.count == raw.count {
-            var diff = 0.0
-            for i in 0..<raw.count { diff += abs(raw[i] - prev[i]) }
-            if diff / Double(raw.count) > cfg.cutThreshold { cut = true }
-        }
-        prevRaw = raw
-
-        var out = pipeline.process(raw, snap: cut)
-
+    private func emitLatest() {
+        guard !stopped, let samples = latestSamples else { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        let dt = lastOutputTime.map { max(0, started - $0) } ?? 1.0 / Double(max(1, cfg.fps))
+        lastOutputTime = started
+        var colors = pipeline.process(samples.colors, luminances: samples.luminances,
+                                      deltaTime: dt, snap: pendingCut)
+        pendingCut = false
         if cfg.audio {
-            audioLock.lock(); let lvl = audioLevel; audioLock.unlock()
-            // sqrt curve: moderate audio should already read near full
-            // brightness, so the lamp pulses rather than sitting dim. A linear
-            // map spends most of a film in the bottom half of its range.
-            let k = (1 - cfg.audioDepth) + cfg.audioDepth * lvl.squareRoot()
-            for i in 0..<out.count { out[i] = UInt8(Double(out[i]) * k) }
+            audioLock.lock()
+            let level = audioLevel, fresh = started - lastAudioTime < 1
+            audioLock.unlock()
+            // If audio capture stops, retain picture lighting instead of getting stuck dim.
+            let scale = fresh ? (1 - unit(cfg.audioDepth)) + unit(cfg.audioDepth) * level.squareRoot() : 1
+            for i in colors.indices { colors[i] = UInt8(Double(colors[i]) * scale) }
         }
-
-        sink.send(out)
-
-        if cfg.preview && frames % max(1, cfg.fps / 12) == 0 {
-            var bar = "\r"
-            for i in 0..<cfg.ledCount {
-                bar += "\u{1B}[48;2;\(out[i*3]);\(out[i*3+1]);\(out[i*3+2])m "
+        sink.send(expandLightZones(colors, cfg: cfg))
+        if started - reportTime >= 0.5 {
+            measuredFPS = Double(reportFrames) / (started - reportTime)
+            reportFrames = 0; reportTime = started
+        }
+        if started - lastPreviewTime >= 0.1 {
+            lastPreviewTime = started
+            let visible = previewZones(colors, cfg: cfg)
+            if cfg.preview {
+                var line = "\r"
+                for z in 0..<visible.count / 3 {
+                    line += "\u{1B}[48;2;\(visible[z * 3]);\(visible[z * 3 + 1]);\(visible[z * 3 + 2])m  "
+                }
+                FileHandle.standardError.write((line + "\u{1B}[0m").data(using: .utf8)!)
             }
-            bar += "\u{1B}[0m"
-            FileHandle.standardError.write(bar.data(using: .utf8)!)
-        }
-
-        frames += 1
-        if Date().timeIntervalSince(lastReport) >= 5 {
-            let fps = Double(frames) / Date().timeIntervalSince(lastReport)
-            FileHandle.standardError.write(
-                String(format: "%@  %.1f fps%@%@%@\n", cfg.preview ? "\n" : "", fps,
-                       cfg.letterbox ? "  picture \(contentW)x\(contentH) of \(w)x\(h)" : "",
-                       cut ? "  [cut]" : "",
-                       cfg.audio ? String(format: "  audio %.2f%@", audioLevel,
-                                               audioFails > 0
-                                                 ? " EXTRACT-FAIL=\(audioFails) st=\(audioStatus)"
-                                                 : "") : "").data(using: .utf8)!)
-            frames = 0
-            lastReport = Date()
+            if let callback = onPreview {
+                let labels = cfg.layout == .columns ? (1...max(1, cfg.ledCount)).map { "LED \($0)" } : cfg.layout.labels
+                let preview = FramePreview(colors: visible, labels: labels, captureFPS: measuredFPS,
+                                           processingMS: samplingMS + (ProcessInfo.processInfo.systemUptime - started) * 1000,
+                                           pictureRect: samples.pictureRect)
+                DispatchQueue.main.async { callback(preview) }
+            }
         }
     }
 }
-

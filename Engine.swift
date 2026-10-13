@@ -21,8 +21,26 @@ struct Config {
     var host = "4.3.2.1"
     var port: UInt16 = 21324
     var ledCount = 30
-    var fps = 60
+    var fps = 30
     var displayIndex = 0
+    var displayID: CGDirectDisplayID?
+    var windowID: CGWindowID?
+    /// Optional normalized crop, relative to the selected display/window.
+    var cropRect: CGRect?
+    var layout: LightLayout = .perimeter
+    var analysisWidth = 192
+    var edgeDepth = 0.20
+    var excludeSubtitles = true
+    var responseTime = 0.12
+    var leftGain = [1.0, 1.0, 1.0]
+    var rightGain = [1.0, 1.0, 1.0]
+    var reverseLeft = false
+    var reverseRight = false
+    var swapSides = false
+    var bleID: UUID?
+    var bleRightID: UUID?
+    var listSources = false
+    var listDevices = false
 
     /// Fraction of screen height, measured from the top, that feeds the LEDs.
     /// 1.0 = whole screen. ~0.4 is the classic bias-lighting look for a bar
@@ -75,7 +93,7 @@ struct Config {
     /// ScreenCaptureKit stream as the pixels -- the digital output stream, not
     /// a microphone, so fans and room noise cannot reach it.
     var audio = false
-    var audioDepth = 0.45        // 0 = colour only, 1 = fully audio-driven
+    var audioDepth = 0.15        // 0 = colour only, 1 = fully audio-driven
 
     var testMode = false
     var preview = false
@@ -94,7 +112,7 @@ struct Config {
 /// Builds a LotusLampX E1 frame: `7E <len> <cmd> p0 p1 p2 p3 p4 EF`.
 ///
 /// There is no checksum. `len` is a hardcoded per-command constant (4 for
-/// BRIGHTNESS, 7 for everything else) and does not describe the real length,
+/// BRIGHTNESS/SPEED, 6 for DATA_TIME, usually 7) and does not describe the real length,
 /// which is always 9. Slots 3-7 are payload; unused ones keep their defaults.
 func e1(_ cmd: UInt8, _ params: [UInt8]) -> Data {
     // The `len` byte is a per-command constant, NOT a length -- the frame is
@@ -153,8 +171,39 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         case "--host":       c.host = val()
         case "--port":       c.port = UInt16(val()) ?? 21324
         case "--leds":       c.ledCount = Int(val()) ?? 30
-        case "--fps":        c.fps = max(1, Int(val()) ?? 60)
-        case "--display":    c.displayIndex = Int(val()) ?? 0
+        case "--fps":        c.fps = Int(val()) ?? 0
+        case "--display":    c.displayIndex = Int(val()) ?? -1
+        case "--display-id", "--window":
+            guard let id = UInt32(val()), id > 0 else { fputs("source ID must be a positive integer\n", stderr); exit(64) }
+            if a == "--display-id" { c.displayID = id } else { c.windowID = id }
+        case "--list-sources": c.listSources = true
+        case "--list-devices": c.listDevices = true
+        case "--device-id", "--right-device-id":
+            guard let id = UUID(uuidString: val()) else {
+                fputs("invalid Bluetooth UUID\n", stderr); exit(64)
+            }
+            if a == "--device-id" { c.bleID = id } else { c.bleRightID = id }
+            if c.bleName == nil { c.bleName = "MELK" }
+        case "--layout":
+            guard let layout = LightLayout(rawValue: val()) else {
+                fputs("layout must be whole, perimeter, sides, four or columns\n", stderr); exit(64)
+            }
+            c.layout = layout
+        case "--analysis-width": c.analysisWidth = Int(val()) ?? 192
+        case "--edge-depth": c.edgeDepth = Double(val()) ?? 0.2
+        case "--response-ms": c.responseTime = (Double(val()) ?? 120) / 1000
+        case "--black-point": c.blackPoint = Double(val()) ?? 0.025
+        case "--include-subtitles": c.excludeSubtitles = false
+        case "--reverse-left": c.reverseLeft = true
+        case "--reverse-right": c.reverseRight = true
+        case "--swap-sides": c.swapSides = true
+        case "--left-gain", "--right-gain":
+            let values = val().split(separator: ",").compactMap { Double($0) }
+            if a == "--left-gain" { c.leftGain = values } else { c.rightGain = values }
+        case "--crop":
+            let values = val().split(separator: ",").compactMap { Double($0) }
+            guard values.count == 4 else { fputs("crop requires x,y,width,height\n", stderr); exit(64) }
+            c.cropRect = CGRect(x: values[0], y: values[1], width: values[2], height: values[3])
         case "--region":     c.regionHeight = Double(val()) ?? 0.4
         case "--smoothing":  c.smoothing = Double(val()) ?? 0.35
         case "--saturation": c.saturation = Double(val()) ?? 1.35
@@ -166,7 +215,9 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         case "--selftest":   c.selfTest = true
         case "--mic":        c.micLevel = Int(val()) ?? 128
         case "--mic-off":    c.micOff = true
-        case "--step":       c.stepSeconds = Double(val())
+        case "--step":
+            guard let delay = Double(val()) else { fputs("controller command delay must be a number\n", stderr); exit(64) }
+            c.stepSeconds = delay
 
         // Controller commands. Each appends a frame, so they compose:
         //   --scene 24 --speed 200 --set-brightness 180
@@ -223,14 +274,32 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         case "--ble-deadband": c.bleDeadband = Int(val()) ?? 4
         case "-h", "--help":
             print("""
-            ambilight — stream screen colors to WLED
+            ambilight — stream screen colors over Bluetooth or to WLED
 
+              --layout <name>     whole | perimeter | sides | four | columns
+              --analysis-width <n> capture width, independent of light count (192)
+              --edge-depth <0.05..0.5> inward depth of edge regions (0.20)
+              --response-ms <n>    smoothing time constant (120)
+              --black-point <n>    black threshold (movie: 0.025)
+              --include-subtitles include bottom-centre text in sampling
+              --left-gain <r,g,b>  channel calibration multipliers (0...2)
+              --right-gain <r,g,b> calibration for the right physical bar
+              --reverse-left      reverse left bar pixel order (WLED)
+              --reverse-right     reverse right bar pixel order (WLED)
+              --swap-sides        swap picture sides before calibration
+              --list-sources      list available displays and windows
+              --display-id <n>    capture a stable display ID
+              --window <n>        capture a player window ID
+              --crop <x,y,w,h>    normalized crop of selected source
+              --list-devices      scan Bluetooth lights for eight seconds
+              --device-id <uuid>  pin a specific BLE controller
+              --right-device-id <uuid> separate second BLE controller (sides only)
               --host <ip>          WLED IP address        (default 4.3.2.1)
               --port <n>           UDP port               (default 21324)
               --leds <n>           number of LEDs         (default 30)
-              --fps <n>            target frame rate      (default 60)
+              --fps <n>            target frame rate      (default 30)
               --display <n>        display index          (default 0)
-              --region <0..1>      top fraction of screen (default 0.4, 1.0 = all)
+              --region <0..1>      top fraction, columns layout only (default 0.4)
               --smoothing <0..1>   higher = snappier      (default 0.35)
               --saturation <f>     color boost            (default 1.35)
               --gamma <f>          gamma correction       (default 2.2)
@@ -242,10 +311,10 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
               --profile <name>     feel preset: calm | balanced | punchy | movie
               --letterbox          ignore black bars, sample only the picture
               --no-letterbox       disable the above
-              --test               cycle colors, no screen capture
+              --test               static layout colours, no screen capture
               --preview            draw the computed LED colors in the terminal
               --audio              pulse intensity with system audio
-              --audio-depth <0..1> how strongly        (default 0.6)
+              --audio-depth <0..1> how strongly        (default 0.15)
 
             BLE mode (existing LotusLampX / MELK controller, no extra hardware):
               --ble <name>         connect to this BLE device (substring match)
@@ -305,11 +374,13 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
             // Lower normalize than punchy on purpose: films use darkness
             // deliberately, and lifting every night scene to full brightness
             // fights the thing you are watching.
-            p = (0.30, 1.90, 0.50, 0.90, 20, 3, 0.75, 0.18)
-            if !c.explicit.contains("--letterbox") { c.letterbox = true }
+            p = (0.20, 1.30, 0.18, 0.35, 15, 2, 0.45, 0.18)
+            if !c.explicit.contains("--gamma") { c.gamma = 1.6 }
+            if !c.explicit.contains("--black-point") { c.blackPoint = 0.025 }
+            if !c.explicit.contains("--no-letterbox") { c.letterbox = true }
         default:
             FileHandle.standardError.write(
-                "unknown profile \"\(name)\" (calm | balanced | punchy)\n".data(using: .utf8)!)
+                "unknown profile \"\(name)\" (calm | balanced | punchy | movie)\n".data(using: .utf8)!)
             exit(64)
         }
         if !c.explicit.contains("--smoothing")    { c.smoothing = p.0 }
@@ -320,676 +391,16 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         if !c.explicit.contains("--ble-deadband") { c.bleDeadband = p.5 }
         if !c.explicit.contains("--vividness")    { c.vividness = p.6 }
         if !c.explicit.contains("--cut")          { c.cutThreshold = p.7 }
+        if !c.explicit.contains("--response-ms") && !c.explicit.contains("--smoothing") {
+            switch name.lowercased() {
+            case "calm": c.responseTime = 0.5
+            case "punchy": c.responseTime = 0.04
+            default: c.responseTime = 0.12
+            }
+        }
     }
+    if c.bleRightID != nil && !c.explicit.contains("--layout") { c.layout = .sides }
     return c
-}
-
-// MARK: - UDP sender
-
-/// Anything that can accept a frame of LED colors.
-protocol ColorSink: AnyObject {
-    func send(_ colors: [UInt8])
-    /// Go dark without tearing down the connection (system sleep).
-    func suspend()
-    func resume()
-}
-
-extension ColorSink {
-    func suspend() {}
-    func resume() {}
-}
-
-final class WLEDSender: ColorSink {
-    private let fd: Int32
-    private var addr: sockaddr_in
-    private let ledCount: Int
-    private var packet: [UInt8]
-
-    init?(host: String, port: UInt16, ledCount: Int) {
-        guard ledCount > 0, ledCount <= 490 else {
-            FileHandle.standardError.write("led count must be 1...490 for DRGB\n".data(using: .utf8)!)
-            return nil
-        }
-        fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return nil }
-
-        addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-
-        // Accept either a literal IP or a hostname (e.g. "wled-a1b2c3.local"),
-        // so you don't have to pin a DHCP lease just to run this.
-        if inet_pton(AF_INET, host, &addr.sin_addr) != 1 {
-            var hints = addrinfo()
-            hints.ai_family = AF_INET
-            hints.ai_socktype = SOCK_DGRAM
-            var res: UnsafeMutablePointer<addrinfo>?
-            guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
-                FileHandle.standardError.write("cannot resolve host: \(host)\n".data(using: .utf8)!)
-                return nil
-            }
-            defer { freeaddrinfo(res) }
-            guard let sa = first.pointee.ai_addr else { return nil }
-            addr.sin_addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
-                $0.pointee.sin_addr
-            }
-            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            inet_ntop(AF_INET, &addr.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
-            FileHandle.standardError.write(
-                "resolved \(host) -> \(String(cString: buf))\n".data(using: .utf8)!)
-        }
-
-        self.ledCount = ledCount
-        // 2 header bytes + RGB triplets, reused every frame to avoid churn.
-        packet = [UInt8](repeating: 0, count: 2 + ledCount * 3)
-        packet[0] = 2   // DRGB
-        packet[1] = 2   // revert to normal effects 2s after we stop sending
-    }
-
-    deinit { close(fd) }
-
-    /// colors: ledCount RGB triplets, 0...255
-    func send(_ colors: [UInt8]) {
-        guard colors.count == ledCount * 3 else { return }
-        for i in 0..<colors.count { packet[2 + i] = colors[i] }
-        withUnsafePointer(to: &addr) { ap in
-            ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                _ = packet.withUnsafeBytes { buf in
-                    sendto(fd, buf.baseAddress, buf.count, 0,
-                           sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
-    }
-}
-
-
-// MARK: - BLE sink (LotusLampX / MELK "E1" protocol)
-
-/// Drives a cheap BLE LED controller of the LotusLampX / MELK family.
-///
-/// The protocol is a fixed 9-byte frame with five payload slots and no
-/// fragmentation, so it can only ever carry ONE solid color for the entire
-/// strip -- there is no per-pixel command. We therefore collapse the whole
-/// zone frame down to a single average color.
-///
-///   COLOR:  7E 07 05 03 RR GG BB 10 EF      (no checksum)
-///   ON:     7E 07 04 FF 01 01 02 01 EF
-final class BLESender: NSObject, ColorSink, CBCentralManagerDelegate, CBPeripheralDelegate {
-    private let serviceUUID = CBUUID(string: "FFF0")
-    private let writeUUID   = CBUUID(string: "FFF3")
-
-    private var central: CBCentralManager!
-    private var peripheral: CBPeripheral?
-    private var writeChar: CBCharacteristic?
-
-    private let nameFilter: String
-    private let minInterval: TimeInterval
-    private let deadband: Int
-
-    private let lock = NSLock()
-    private var pending: (UInt8, UInt8, UInt8)?
-    private var lastSent: (UInt8, UInt8, UInt8)?
-    private var lastWrite = Date.distantPast
-    private(set) var writes = 0
-    private var suspended = false
-    /// Longest the lamp may hold a stale color while the screen drifts.
-    private let maxHold: TimeInterval = 1.0
-
-    private let oneShot: [Data]
-    var stepDelay: TimeInterval = 0.15
-    var onOneShotComplete: (() -> Void)?
-
-    init(nameFilter: String, rate: Double, deadband: Int, oneShot: [Data] = []) {
-        self.oneShot = oneShot
-        self.nameFilter = nameFilter
-        self.minInterval = 1.0 / max(1.0, rate)
-        self.deadband = deadband
-        super.init()
-        // Main queue, so RunLoop.main drives the BLE stack.
-        central = CBCentralManager(delegate: self, queue: .main)
-
-        // Report regardless of whether anything was written, so a silent link
-        // is distinguishable from a quiet screen.
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let c = self.lastSent
-            let state = self.writeChar == nil ? "  (not connected)" : ""
-            self.err(String(format: "ble: %.1f writes/s  rgb=%d,%d,%d%@\n",
-                            Double(self.writes) / 5.0,
-                            Int(c?.0 ?? 0), Int(c?.1 ?? 0), Int(c?.2 ?? 0), state))
-            self.writes = 0
-        }
-    }
-
-    private func err(_ m: String) {
-        FileHandle.standardError.write(m.data(using: .utf8)!)
-    }
-
-    // MARK: ColorSink
-
-    func send(_ colors: [UInt8]) {
-        let n = colors.count / 3
-        guard n > 0 else { return }
-        var r = 0, g = 0, b = 0
-        for i in 0..<n {
-            r += Int(colors[i * 3]); g += Int(colors[i * 3 + 1]); b += Int(colors[i * 3 + 2])
-        }
-        let c = (UInt8(r / n), UInt8(g / n), UInt8(b / n))
-        lock.lock(); pending = c; lock.unlock()
-        DispatchQueue.main.async { [weak self] in self?.flush() }
-    }
-
-    // MARK: writing
-
-    private func colorFrame(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Data {
-        Data([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF])
-    }
-
-    func suspend() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, !self.suspended else { return }
-            self.suspended = true
-            guard let p = self.peripheral, let ch = self.writeChar else { return }
-            // Live connection already in hand -- go dark immediately rather
-            // than reconnecting while the machine is shutting down.
-            p.writeValue(Data([0x7E, 0x07, 0x04, 0x00, 0x01, 0x00, 0x02, 0x01, 0xEF]),
-                         for: ch, type: .withoutResponse)
-            self.err("ble: suspended (lamp off)\n")
-        }
-    }
-
-    func resume() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.suspended else { return }
-            self.suspended = false
-            self.lastSent = nil          // force the next color through
-            guard let p = self.peripheral, let ch = self.writeChar else { return }
-            p.writeValue(Data([0x7E, 0x07, 0x04, 0xFF, 0x01, 0x01, 0x02, 0x01, 0xEF]),
-                         for: ch, type: .withoutResponse)
-            self.err("ble: resumed\n")
-        }
-    }
-
-    private func flush() {
-        guard !suspended else { return }
-        guard let p = peripheral, let ch = writeChar else { return }
-        lock.lock(); let want = pending; lock.unlock()
-        guard let c = want else { return }
-
-        // Rate ceiling: these controllers have no flow control on
-        // write-without-response, so overrunning them just drops frames.
-        guard Date().timeIntervalSince(lastWrite) >= minInterval else { return }
-
-        // Deadband, so a still screen stops generating radio traffic -- but
-        // bounded by maxHold, otherwise a color that drifts one count at a
-        // time never clears the threshold and the lamp freezes while the
-        // screen changes completely.
-        if let l = lastSent {
-            let delta = max(abs(Int(c.0) - Int(l.0)),
-                            abs(Int(c.1) - Int(l.1)),
-                            abs(Int(c.2) - Int(l.2)))
-            if delta == 0 { return }
-            let stale = Date().timeIntervalSince(lastWrite) >= maxHold
-            if delta < deadband && !stale { return }
-        }
-
-        guard p.canSendWriteWithoutResponse else { return }
-
-        p.writeValue(colorFrame(c.0, c.1, c.2), for: ch, type: .withoutResponse)
-        lastSent = c
-        lastWrite = Date()
-        writes += 1
-    }
-
-    func peripheralIsReady(toSendWriteWithoutResponse p: CBPeripheral) { flush() }
-
-    // MARK: central delegate
-
-    func centralManagerDidUpdateState(_ c: CBCentralManager) {
-        switch c.state {
-        case .poweredOn:
-            err("ble: scanning for \"\(nameFilter)\"...\n")
-            c.scanForPeripherals(withServices: nil, options: nil)
-        case .unauthorized:
-            err("""
-            !! Bluetooth permission denied for this process.
-               System Settings > Privacy & Security > Bluetooth -> enable for
-               the app running this (Terminal, iTerm, or Claude Code).
-
-            """)
-            exit(2)
-        case .poweredOff:
-            err("!! Bluetooth is off.\n"); exit(3)
-        case .unsupported:
-            err("!! Bluetooth unsupported on this machine.\n"); exit(4)
-        default:
-            break
-        }
-    }
-
-    func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
-                        advertisementData ad: [String: Any], rssi RSSI: NSNumber) {
-        let name = (ad[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? ""
-        let advertisesService =
-            (ad[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(serviceUUID) ?? false
-        let matches = nameFilter.isEmpty
-            ? advertisesService
-            : name.lowercased().contains(nameFilter.lowercased())
-        guard matches else { return }
-
-        err("ble: found \"\(name)\" rssi=\(RSSI) -- connecting\n")
-        c.stopScan()
-        peripheral = p
-        p.delegate = self
-        c.connect(p, options: nil)
-    }
-
-    func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        err("ble: connected, discovering FFF0\n")
-        p.discoverServices([serviceUUID])
-    }
-
-    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        err("ble: connect failed (\(error?.localizedDescription ?? "unknown")), retrying\n")
-        c.connect(p, options: nil)
-    }
-
-    func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral,
-                        error: Error?) {
-        err("ble: disconnected, reconnecting\n")
-        writeChar = nil
-        c.connect(p, options: nil)
-    }
-
-    // MARK: peripheral delegate
-
-    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let svcs = p.services, !svcs.isEmpty else {
-            err("ble: service FFF0 not found -- is this really a LotusLampX device?\n")
-            return
-        }
-        for s in svcs where s.uuid == serviceUUID {
-            p.discoverCharacteristics([writeUUID], for: s)
-        }
-    }
-
-    func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService,
-                    error: Error?) {
-        for ch in s.characteristics ?? [] where ch.uuid == writeUUID {
-            guard ch.properties.contains(.writeWithoutResponse) else {
-                err("ble: FFF3 lacks write-without-response\n"); continue
-            }
-            writeChar = ch
-            err("ble: ready (FFF3)\n")
-            // Make sure the lamp is actually on before we start sending colors.
-            p.writeValue(Data([0x7E, 0x07, 0x04, 0xFF, 0x01, 0x01, 0x02, 0x01, 0xEF]),
-                         for: ch, type: .withoutResponse)
-
-            // One-shot command mode: space the writes out, since
-            // write-without-response has no flow control, then quit.
-            if !oneShot.isEmpty {
-                for (i, frame) in oneShot.enumerated() {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + stepDelay * Double(i + 1)) {
-                        self.err("ble: -> " + frame.map { String(format: "%02X", $0) }
-                                                   .joined(separator: " ") + "\n")
-                        p.writeValue(frame, for: ch, type: .withoutResponse)
-                    }
-                }
-                DispatchQueue.main.asyncAfter(
-                    deadline: .now() + stepDelay * Double(oneShot.count + 2)) {
-                    self.onOneShotComplete?()
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Color pipeline
-
-struct ColorPipeline {
-    let cfg: Config
-    private var smoothed: [Double]
-    private let gammaLUT: [UInt8]
-
-    init(cfg: Config) {
-        self.cfg = cfg
-        smoothed = [Double](repeating: 0, count: cfg.ledCount * 3)
-        // Precompute gamma + brightness so the hot path is a table lookup.
-        gammaLUT = (0...255).map { i in
-            let v = pow(Double(i) / 255.0, cfg.gamma) * cfg.brightness
-            return UInt8(max(0, min(255, (v * 255.0).rounded())))
-        }
-    }
-
-    /// raw: ledCount linear RGB triplets in 0...1
-    mutating func process(_ raw: [Double], snap: Bool = false) -> [UInt8] {
-        var out = [UInt8](repeating: 0, count: cfg.ledCount * 3)
-        let a = snap ? 1.0 : cfg.smoothing
-
-        for led in 0..<cfg.ledCount {
-            let o = led * 3
-            var r = raw[o], g = raw[o + 1], b = raw[o + 2]
-
-            // Saturation boost around luma — screen averages are washed out
-            // because averaging pulls everything toward grey.
-            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            if luma < cfg.blackPoint {
-                r = 0; g = 0; b = 0
-            } else {
-                r = max(0, min(1, luma + (r - luma) * cfg.saturation))
-                g = max(0, min(1, luma + (g - luma) * cfg.saturation))
-                b = max(0, min(1, luma + (b - luma) * cfg.saturation))
-            }
-
-            // Scale the color up until its brightest channel saturates,
-            // then blend back toward the original by `normalize`. Hue and
-            // relative channel ratios are preserved; only level changes.
-            if cfg.normalize > 0 {
-                let peak = max(r, max(g, b))
-                if peak > 0.02 {
-                    let k = 1.0 / peak
-                    r += (r * k - r) * cfg.normalize
-                    g += (g * k - g) * cfg.normalize
-                    b += (b * k - b) * cfg.normalize
-                }
-            }
-
-            smoothed[o]     += (r - smoothed[o])     * a
-            smoothed[o + 1] += (g - smoothed[o + 1]) * a
-            smoothed[o + 2] += (b - smoothed[o + 2]) * a
-
-            out[o]     = gammaLUT[Int(max(0, min(255, (smoothed[o]     * 255).rounded())))]
-            out[o + 1] = gammaLUT[Int(max(0, min(255, (smoothed[o + 1] * 255).rounded())))]
-            out[o + 2] = gammaLUT[Int(max(0, min(255, (smoothed[o + 2] * 255).rounded())))]
-        }
-        return out
-    }
-}
-
-// MARK: - Capture
-
-final class FrameHandler: NSObject, SCStreamOutput {
-    private let cfg: Config
-    private let sink: ColorSink
-    private var pipeline: ColorPipeline
-    private var frames = 0
-    private var lastReport = Date()
-
-    // Audio level, written on the audio queue and read on the video queue.
-    private var prevRaw: [Double]?
-    private let audioLock = NSLock()
-    private var audioLevel = 0.0
-    private var audioPeak = 0.02
-    private var audioBuffers = 0
-    private var audioFails = 0
-    private var audioSamples = 0
-    private var audioRawMax = 0.0
-    private var audioStatus = 0
-    private var audioNeeded = 0
-
-    /// Stable picture bounds. They expand instantly and contract slowly, so a
-    /// dark scene is never mistaken for a wider black bar -- bars are
-    /// permanent, dark scenes are not.
-    private var sTop = 0.0, sBot = 0.0, sLeft = 0.0, sRight = 0.0
-    private var boundsReady = false
-    private let barLevel = 12      // channel value still counted as "black bar"
-    private let contract = 0.005   // ~3s to give picture area back
-
-    /// Horizontal samples per LED. More than 1 smooths out single-pixel noise.
-    private let samplesPerLED = 4
-
-    var captureWidth: Int { min(960, cfg.ledCount * samplesPerLED) }
-
-    /// Set once the display is known. The capture MUST match the display's
-    /// aspect ratio: ScreenCaptureKit letterboxes a mismatched frame, and those
-    /// black bars land on the first and last zones, leaving both ends of the
-    /// strip permanently dark.
-    var captureHeight: Int = 32
-
-    init(cfg: Config, sink: ColorSink) {
-        self.cfg = cfg
-        self.sink = sink
-        self.pipeline = ColorPipeline(cfg: cfg)
-    }
-
-
-    /// True when every sampled pixel in the row is dark enough to be a bar.
-    private func rowIsBar(_ b: UnsafePointer<UInt8>, _ y: Int, _ w: Int, _ st: Int) -> Bool {
-        let row = b + y * st
-        var x = 0
-        while x < w {
-            let p = row + x * 4
-            if Int(p[0]) > barLevel || Int(p[1]) > barLevel || Int(p[2]) > barLevel {
-                return false
-            }
-            x += 2
-        }
-        return true
-    }
-
-    private func colIsBar(_ b: UnsafePointer<UInt8>, _ x: Int, _ h: Int, _ st: Int) -> Bool {
-        var y = 0
-        while y < h {
-            let p = b + y * st + x * 4
-            if Int(p[0]) > barLevel || Int(p[1]) > barLevel || Int(p[2]) > barLevel {
-                return false
-            }
-            y += 2
-        }
-        return true
-    }
-
-    /// Picture bounds for this frame, inset past any black bars.
-    func detectBars(_ b: UnsafePointer<UInt8>, _ w: Int, _ h: Int, _ st: Int)
-        -> (Int, Int, Int, Int) {
-        var top = 0, bot = h - 1, left = 0, right = w - 1
-        while top < h / 2 && rowIsBar(b, top, w, st) { top += 1 }
-        while bot > h / 2 && rowIsBar(b, bot, w, st) { bot -= 1 }
-        while left < w / 2 && colIsBar(b, left, h, st) { left += 1 }
-        while right > w / 2 && colIsBar(b, right, h, st) { right -= 1 }
-        return (top, bot, left, right)
-    }
-
-
-    /// RMS of a system-audio block, normalised against a slowly decaying peak
-    /// so quiet passages still modulate rather than sitting at zero.
-    private func handleAudio(_ sb: CMSampleBuffer) {
-        guard CMSampleBufferIsValid(sb) else { audioFails += 1; return }
-        audioBuffers += 1
-
-        // Two-call pattern: ask how big the list needs to be, then allocate
-        // exactly that. Guessing the size fails with ArrayTooSmall (-12737),
-        // and every sample is then silently discarded.
-        var sizeNeeded = 0
-        var probe = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb,
-            bufferListSizeNeededOut: &sizeNeeded,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: nil)
-        audioNeeded = sizeNeeded
-        guard probe == noErr, sizeNeeded > 0 else {
-            audioStatus = Int(probe); audioFails += 1; return
-        }
-
-        let raw = UnsafeMutableRawPointer.allocate(byteCount: sizeNeeded, alignment: 16)
-        raw.initializeMemory(as: UInt8.self, repeating: 0, count: sizeNeeded)
-        defer { raw.deallocate() }
-        let ablPtr = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
-
-        var block: CMBlockBuffer?
-        probe = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: ablPtr,
-            bufferListSize: sizeNeeded,
-            blockBufferAllocator: kCFAllocatorDefault,
-            blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            blockBufferOut: &block)
-        let status = probe
-        audioStatus = Int(status)
-        guard status == noErr else { audioFails += 1; return }
-
-        var sum = 0.0
-        var count = 0
-        for buf in UnsafeMutableAudioBufferListPointer(ablPtr) {
-            guard let data = buf.mData else { continue }
-            let n = Int(buf.mDataByteSize) / MemoryLayout<Float32>.size
-            let p = data.assumingMemoryBound(to: Float32.self)
-            var i = 0
-            while i < n {
-                let v = Double(p[i])
-                sum += v * v
-                i += 2            // every other sample is plenty for an envelope
-                count += 1
-            }
-        }
-        guard count > 0 else { audioFails += 1; return }
-        let rms = (sum / Double(count)).squareRoot()
-        audioSamples = count
-        if rms > audioRawMax { audioRawMax = rms }
-
-        audioLock.lock()
-        audioPeak = max(rms, audioPeak * 0.9992)          // slow decay
-        let lvl = min(1.0, rms / max(audioPeak, 0.004))
-        // Attack fast, release slow -- a light that drops instantly on every
-        // gap between words reads as flicker.
-        let a = lvl > audioLevel ? 0.5 : 0.04
-        audioLevel += (lvl - audioLevel) * a
-        audioLock.unlock()
-    }
-
-    func stream(_ stream: SCStream,
-                didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-                of type: SCStreamOutputType) {
-        if type == .audio {
-            handleAudio(sampleBuffer)
-            return
-        }
-        guard type == .screen,
-              CMSampleBufferIsValid(sampleBuffer),
-              let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-        CVPixelBufferLockBaseAddress(px, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
-
-        guard let base = CVPixelBufferGetBaseAddress(px) else { return }
-        let w = CVPixelBufferGetWidth(px)
-        let h = CVPixelBufferGetHeight(px)
-        let stride = CVPixelBufferGetBytesPerRow(px)
-        let bytes = base.assumingMemoryBound(to: UInt8.self)
-
-        // Picture area: the whole frame, or just the part inside the bars.
-        var top = 0, bot = h - 1, left = 0, right = w - 1
-        if cfg.letterbox {
-            let (dt, db, dl, dr) = detectBars(bytes, w, h, stride)
-            // A frame that is almost entirely dark is a dark scene, not a bar
-            // layout -- ignore it and keep whatever bounds we had.
-            let plausible = (db - dt) > h / 5 && (dr - dl) > w / 5
-            if !boundsReady {
-                (sTop, sBot, sLeft, sRight) = (Double(dt), Double(db), Double(dl), Double(dr))
-                boundsReady = true
-            } else if plausible {
-                // Grow at once, give area back slowly.
-                sTop   = dt <= Int(sTop)   ? Double(dt) : sTop + (Double(dt) - sTop) * contract
-                sBot   = db >= Int(sBot)   ? Double(db) : sBot + (Double(db) - sBot) * contract
-                sLeft  = dl <= Int(sLeft)  ? Double(dl) : sLeft + (Double(dl) - sLeft) * contract
-                sRight = dr >= Int(sRight) ? Double(dr) : sRight + (Double(dr) - sRight) * contract
-            }
-            top = max(0, Int(sTop)); bot = min(h - 1, Int(sBot))
-            left = max(0, Int(sLeft)); right = min(w - 1, Int(sRight))
-            if bot <= top { top = 0; bot = h - 1 }
-            if right <= left { left = 0; right = w - 1 }
-        }
-
-        let contentH = bot - top + 1
-        let contentW = right - left + 1
-
-        // Only the top `regionHeight` slice of the picture drives the LEDs.
-        let rows = max(1, Int(Double(contentH) * cfg.regionHeight))
-        var raw = [Double](repeating: 0, count: cfg.ledCount * 3)
-
-        for led in 0..<cfg.ledCount {
-            let x0 = left + led * contentW / cfg.ledCount
-            let x1 = max(x0 + 1, left + (led + 1) * contentW / cfg.ledCount)
-            var rs = 0.0, gs = 0.0, bs = 0.0
-            var wsum = 0.0
-
-            for y in top..<min(top + rows, h) {
-                let row = bytes + y * stride
-                for x in x0..<min(x1, w) {
-                    let p = row + x * 4          // BGRA
-                    let b = Double(p[0]), g = Double(p[1]), r = Double(p[2])
-
-                    // Weight each pixel by how colourful it is. A flat mean is
-                    // dominated by grey UI and dark background, which is what
-                    // makes averaged screen colour look muddy; this lets the
-                    // few saturated pixels that define a shot actually carry it.
-                    let wgt = chromaWeight(r, g, b, cfg.vividness)
-
-                    rs += r * wgt; gs += g * wgt; bs += b * wgt
-                    wsum += wgt
-                }
-            }
-            guard wsum > 0 else { continue }
-            let d = wsum * 255.0
-            let o = led * 3
-            raw[o] = rs / d; raw[o + 1] = gs / d; raw[o + 2] = bs / d
-        }
-
-        // A hard cut moves every zone at once. Sliding into the new colour
-        // would spend half a second showing a blend that appears in neither
-        // shot, so on a cut we snap and let smoothing resume after.
-        var cut = false
-        if let prev = prevRaw, prev.count == raw.count {
-            var diff = 0.0
-            for i in 0..<raw.count { diff += abs(raw[i] - prev[i]) }
-            if diff / Double(raw.count) > cfg.cutThreshold { cut = true }
-        }
-        prevRaw = raw
-
-        var out = pipeline.process(raw, snap: cut)
-
-        if cfg.audio {
-            audioLock.lock(); let lvl = audioLevel; audioLock.unlock()
-            // sqrt curve: moderate audio should already read near full
-            // brightness, so the lamp pulses rather than sitting dim. A linear
-            // map spends most of a film in the bottom half of its range.
-            let k = (1 - cfg.audioDepth) + cfg.audioDepth * lvl.squareRoot()
-            for i in 0..<out.count { out[i] = UInt8(Double(out[i]) * k) }
-        }
-
-        sink.send(out)
-
-        if cfg.preview && frames % max(1, cfg.fps / 12) == 0 {
-            var bar = "\r"
-            for i in 0..<cfg.ledCount {
-                bar += "\u{1B}[48;2;\(out[i*3]);\(out[i*3+1]);\(out[i*3+2])m "
-            }
-            bar += "\u{1B}[0m"
-            FileHandle.standardError.write(bar.data(using: .utf8)!)
-        }
-
-        frames += 1
-        if Date().timeIntervalSince(lastReport) >= 5 {
-            let fps = Double(frames) / Date().timeIntervalSince(lastReport)
-            FileHandle.standardError.write(
-                String(format: "%@  %.1f fps%@%@%@\n", cfg.preview ? "\n" : "", fps,
-                       cfg.letterbox ? "  picture \(contentW)x\(contentH) of \(w)x\(h)" : "",
-                       cut ? "  [cut]" : "",
-                       cfg.audio ? String(format: "  audio %.2f%@", audioLevel,
-                                               audioFails > 0
-                                                 ? " EXTRACT-FAIL=\(audioFails) st=\(audioStatus)"
-                                                 : "") : "").data(using: .utf8)!)
-            frames = 0
-            lastReport = Date()
-        }
-    }
 }
 
 // MARK: - Main
@@ -1011,6 +422,7 @@ final class SleepWatcher {
         nc.addObserver(self, selector: #selector(didWake),
                        name: NSWorkspace.screensDidWakeNotification, object: nil)
     }
+    deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
     @objc private func willSleep() { sink.suspend() }
     @objc private func didWake()   { sink.resume() }
 }
@@ -1070,127 +482,181 @@ func hueRamp(count: Int, phase: Double, spread: Double) -> [UInt8] {
 /// the binary that makes it: a bare helper executable inside an app bundle has
 /// no grantable TCC identity of its own, so a spawned child is refused no
 /// matter what the user toggles for the app.
-final class Runner {
+final class Runner: NSObject, SCStreamDelegate {
     private(set) var sink: ColorSink?
     private var stream: SCStream?
     private var handler: FrameHandler?
     private var watcher: SleepWatcher?
     private var oneShot: BLESender?
+    private var startTask: Task<Void, Never>?
+    private var generation = 0
+    private var streamingConfig: Config?
 
     var onStarted: ((String) -> Void)?
     var onError: ((String) -> Void)?
-
+    var onOutputStatus: ((OutputStatus) -> Void)?
+    var onPreview: ((FramePreview) -> Void)?
+    var onDeviceIdentified: ((UUID) -> Void)?
     var isRunning: Bool { stream != nil }
 
-    private func makeSink(_ cfg: Config) -> ColorSink? {
-        if let b = cfg.bleName {
-            return BLESender(nameFilter: b, rate: cfg.bleRate, deadband: cfg.bleDeadband)
+    private func statusCallback(_ token: Int) -> (OutputStatus) -> Void {
+        { [weak self] status in
+            guard let self, self.generation == token else { return }
+            self.onOutputStatus?(status)
         }
-        guard let w = WLEDSender(host: cfg.host, port: cfg.port, ledCount: cfg.ledCount) else {
-            onError?("invalid WLED target \(cfg.host):\(cfg.port)")
-            return nil
-        }
-        return w
     }
 
-    /// Start streaming screen colours. Safe to call repeatedly; replaces any
-    /// session already running.
-    func start(_ cfg: Config) {
+    func start(_ proposed: Config) {
         stop()
-
-        // ScreenCaptureKit never raises the permission prompt on its own: an
-        // app must ask explicitly. Without this the stream simply fails with
-        // "declined", and no amount of toggling Settings helps because the
-        // user was never asked in the first place.
-        if !CGPreflightScreenCaptureAccess() {
-            onError?("requesting screen recording permission")
-            let granted = CGRequestScreenCaptureAccess()
-            if !granted {
-                onError?("screen recording not granted yet -- "
-                         + "allow Ambilight, then relaunch")
-                return
-            }
+        let cfg: Config
+        do { cfg = try validatedConfig(proposed) }
+        catch { onError?(error.localizedDescription); return }
+        let token = generation
+        if !CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess() {
+            onError?("Allow Ambilight in Privacy & Security → Screen & System Audio Recording, then relaunch.")
+            return
         }
-
-        guard let s = makeSink(cfg) else { return }
-        sink = s
-        watcher = SleepWatcher(sink: s)
-        let h = FrameHandler(cfg: cfg, sink: s)
-        handler = h
-
-        Task { [weak self] in
+        onOutputStatus?(OutputStatus(state: "Starting capture"))
+        startTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
-                    false, onScreenWindowsOnly: false)
-                guard cfg.displayIndex < content.displays.count else {
-                    self.onError?("display \(cfg.displayIndex) not found "
-                                  + "(\(content.displays.count) available)")
-                    return
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard !Task.isCancelled, self.generation == token else { return }
+                let filter: SCContentFilter
+                let width: Double, height: Double
+                let sourceName: String
+                if let id = cfg.windowID {
+                    guard let window = content.windows.first(where: { $0.windowID == id }) else {
+                        throw ConfigurationError("The selected player window is unavailable. Choose it again in Settings.")
+                    }
+                    filter = SCContentFilter(desktopIndependentWindow: window)
+                    width = max(1, window.frame.width); height = max(1, window.frame.height)
+                    sourceName = window.title ?? window.owningApplication?.applicationName ?? "Window \(id)"
+                } else {
+                    let display: SCDisplay
+                    if let id = cfg.displayID {
+                        guard let found = content.displays.first(where: { $0.displayID == id }) else {
+                            throw ConfigurationError("The selected display is disconnected. Choose another display in Settings.")
+                        }
+                        display = found
+                    } else {
+                        guard cfg.displayIndex < content.displays.count else { throw ConfigurationError("Display \(cfg.displayIndex) is unavailable") }
+                        display = content.displays[cfg.displayIndex]
+                    }
+                    filter = SCContentFilter(display: display, excludingWindows: [])
+                    width = Double(display.width); height = Double(display.height)
+                    sourceName = "Display \(display.displayID)"
                 }
-                let display = content.displays[cfg.displayIndex]
-
-                // Capture must match the display's aspect ratio, or
-                // ScreenCaptureKit letterboxes and the end zones go black.
-                let aspect = Double(display.height) / Double(display.width)
-                let hh = Int((Double(h.captureWidth) * aspect).rounded())
-                h.captureHeight = max(8, (hh / 2) * 2)
-
+                let s = try makeColorSink(cfg, onStatus: self.statusCallback(token), onIdentified: { [weak self] id in
+                    guard let self, self.generation == token else { return }; self.onDeviceIdentified?(id)
+                })
+                guard !Task.isCancelled, self.generation == token else { s.stop(); return }
+                self.sink = s
+                self.streamingConfig = cfg
+                self.watcher = SleepWatcher(sink: s)
+                let h = FrameHandler(cfg: cfg, sink: s)
+                h.onPreview = { [weak self] preview in
+                    guard let self, self.generation == token else { return }; self.onPreview?(preview)
+                }
+                self.handler = h
+                h.start()
                 let sc = SCStreamConfiguration()
                 sc.width = h.captureWidth
+                h.captureHeight = max(8, Int((Double(h.captureWidth) * height / width).rounded()))
                 sc.height = h.captureHeight
                 sc.pixelFormat = kCVPixelFormatType_32BGRA
+                // Explicit SDR/sRGB analysis. HDR matching still requires visual calibration.
+                sc.colorSpaceName = CGColorSpace.sRGB
                 sc.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-                sc.queueDepth = 3
-                sc.showsCursor = false
-                sc.scalesToFit = true
-                if cfg.audio {
-                    sc.capturesAudio = true
-                    sc.sampleRate = 48000
-                    sc.channelCount = 2
-                }
-
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let st = SCStream(filter: filter, configuration: sc, delegate: nil)
-                try st.addStreamOutput(h, type: .screen,
-                                       sampleHandlerQueue: DispatchQueue(label: "capture"))
-                if cfg.audio {
-                    try st.addStreamOutput(h, type: .audio,
-                                           sampleHandlerQueue: DispatchQueue(label: "audio"))
-                }
+                sc.queueDepth = 2; sc.showsCursor = false; sc.scalesToFit = true
+                if cfg.audio { sc.capturesAudio = true; sc.sampleRate = 48000; sc.channelCount = 2 }
+                let st = SCStream(filter: filter, configuration: sc, delegate: self)
+                try st.addStreamOutput(h, type: .screen, sampleHandlerQueue: h.sampleQueue)
+                if cfg.audio { try st.addStreamOutput(h, type: .audio, sampleHandlerQueue: h.sampleQueue) }
                 try await st.startCapture()
+                guard !Task.isCancelled, self.generation == token else { h.stop(); try? await st.stopCapture(); return }
                 self.stream = st
-                self.onStarted?("""
-                display   \(cfg.displayIndex) (\(display.width)x\(display.height))
-                target    \(cfg.bleName.map { "ble:" + $0 } ?? "\(cfg.host):\(cfg.port)")
-                capture   \(h.captureWidth)x\(h.captureHeight) @ \(cfg.fps)fps
-                feel      \(cfg.profile ?? "default")
-                """)
+                self.onStarted?("source    \(sourceName)\nlayout    \(cfg.layout.title)\ncapture   \(h.captureWidth)x\(h.captureHeight) @ \(cfg.fps)fps\nfeel      \(cfg.profile ?? "custom")")
             } catch {
-                self.onError?("\(error)")
+                guard self.generation == token, !Task.isCancelled else { return }
+                let message = error.localizedDescription
+                self.shutdown { [weak self] in
+                    guard let self, self.generation == token + 1 else { return }
+                    self.onError?(message)
+                }
             }
         }
     }
 
-    func stop() {
-        if let st = stream {
-            Task { try? await st.stopCapture() }
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.stream === stream else { return }
+            let token = self.generation
+            self.shutdown { [weak self] in
+                guard let self, self.generation == token + 1 else { return }
+                self.onError?("Capture stopped: " + error.localizedDescription)
+            }
         }
-        stream = nil
-        handler = nil
-        watcher = nil
-        sink = nil
     }
 
-    /// Fire raw frames at the controller with no capture involved.
-    func send(device: String, frames: [Data], step: TimeInterval = 0.15,
-              completion: (() -> Void)? = nil) {
-        let b = BLESender(nameFilter: device, rate: 10, deadband: 0, oneShot: frames)
+    private func endCapture() {
+        generation += 1
+        startTask?.cancel(); startTask = nil
+        handler?.stop()
+        if let st = stream { Task { try? await st.stopCapture() } }
+        stream = nil; handler = nil; watcher = nil; streamingConfig = nil
+    }
+    func stop() {
+        endCapture()
+        sink?.stop(); sink = nil
+        oneShot?.stop(); oneShot = nil
+    }
+    /// Uses the existing connection to go dark and allows BLE callbacks to drain.
+    func shutdown(completion: @escaping () -> Void) {
+        endCapture()
+        oneShot?.stop(); oneShot = nil
+        guard let output = sink else { completion(); return }
+        sink = nil
+        output.shutdown(completion: completion)
+    }
+
+    /// Reading/off modes use the selected backend, calibration and master brightness.
+    func setStatic(_ proposed: Config, color: [UInt8], off: Bool = false) {
+        stop()
+        do {
+            let cfg = try validatedConfig(proposed), token = generation
+            let s = try makeColorSink(cfg, onStatus: statusCallback(token), onIdentified: onDeviceIdentified)
+            sink = s
+            let count = cfg.layout.zoneCount(ledCount: cfg.ledCount)
+            var raw = [Double]()
+            let rgb = color.count == 3 ? color : [0, 0, 0]
+            for _ in 0..<count { raw += rgb.map { off ? 0 : Double($0) / 255 } }
+            var staticCfg = cfg; staticCfg.normalize = 0; staticCfg.saturation = 1; staticCfg.blackPoint = 0
+            var pipeline = ColorPipeline(cfg: staticCfg)
+            let zones = pipeline.process(raw, snap: true)
+            let physical = expandLightZones(zones, cfg: cfg)
+            onPreview?(FramePreview(colors: previewZones(zones, cfg: cfg), labels: cfg.layout.labels,
+                                    captureFPS: 0, processingMS: 0,
+                                    pictureRect: CGRect(x: 0, y: 0, width: 1, height: 1)))
+            if off { s.suspend() } else { s.send(physical) }
+        } catch { onError?(error.localizedDescription) }
+    }
+
+    /// CLI-only known one-shot controller frames, with bounded connection timeout.
+    func send(device: String, deviceID: UUID? = nil, frames: [Data], step: TimeInterval = 0.15, completion: (() -> Void)? = nil) {
+        stop()
+        let token = generation
+        let b = BLESender(nameFilter: device, rate: 10, deadband: 0, oneShot: frames, deviceID: deviceID, onStatus: statusCallback(token))
         b.stepDelay = step
-        b.onOneShotComplete = { [weak self] in
-            completion?()
-            self?.oneShot = nil
+        b.onOneShotComplete = { [weak self, weak b] in
+            guard let self, self.generation == token else { return }
+            b?.stop(); self.oneShot = nil; completion?()
         }
         oneShot = b
+        // Allow initial pacing and the final controller drain as well as all writes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15 + Double(frames.count + 1) * max(0.15, step)) { [weak self, weak b] in
+            guard let self, self.generation == token, self.oneShot === b else { return }
+            b?.stop(); self.oneShot = nil; self.onError?("Controller command timed out. Disconnect LotusLamp X and check Bluetooth.")
+        }
     }
 }

@@ -5,11 +5,73 @@ import Foundation
 import AppKit
 import ScreenCaptureKit
 
-let cfg = parseArgs()
+let cfg: Config
+do {
+    cfg = try validatedConfig(parseArgs())
+} catch {
+    FileHandle.standardError.write("\(error.localizedDescription)\n".data(using: .utf8)!)
+    exit(64)
+}
 
-signal(SIGINT) { _ in
+// CoreBluetooth and capture callbacks need the main queue to stay free while
+// the final dark frame drains. A POSIX signal handler must not call those APIs.
+var shutdownAction: (() -> Void)?
+var isStopping = false
+func handleTermination() {
+    guard !isStopping else { return }
+    isStopping = true
     print("\nstopping")
-    exit(0)
+    if let shutdown = shutdownAction { shutdown() } else { exit(0) }
+}
+let terminationSignals = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler(handler: handleTermination)
+    source.resume()
+    return source
+}
+
+// MARK: - source discovery (no lighting output)
+
+if cfg.listSources {
+    Task { @MainActor in
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            print("Displays (--display uses the index):")
+            for (index, display) in content.displays.enumerated() {
+                print("  \(index): id=\(display.displayID), \(display.width)x\(display.height)")
+            }
+            print("Windows (--window uses the window ID):")
+            for window in content.windows.sorted(by: { $0.windowID < $1.windowID }) {
+                guard window.frame.width > 1, window.frame.height > 1 else { continue }
+                print("  \(window.windowID): \(window.owningApplication?.applicationName ?? "Application") — \(window.title ?? "Untitled")")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("Cannot list capture sources: \(error.localizedDescription)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    }
+    RunLoop.main.run()
+}
+
+if cfg.listDevices {
+    let discovery = BLEDiscovery()
+    var printed = Set<UUID>()
+    discovery.onDevices = { devices in
+        for device in devices where printed.insert(device.id).inserted {
+            print("\(device.id.uuidString)  \(device.name)  \(device.rssi) dBm")
+        }
+    }
+    shutdownAction = { discovery.stop(); exit(0) }
+    print("Scanning for nearby light controllers for 8 seconds; no commands are sent.")
+    discovery.start()
+    Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { _ in
+        discovery.stop()
+        if printed.isEmpty { print("No matching light controllers found.") }
+        exit(0)
+    }
+    RunLoop.main.run()
 }
 
 // MARK: - self test
@@ -50,6 +112,8 @@ if cfg.selfTest {
     print("  \(vividOK ? "PASS" : "FAIL")  weighted:  \(vivid) (expect strongly red)")
     ok = ok && flatOK && vividOK
 
+    ok = runImmersionTests() && ok
+
     print(ok ? "all passed" : "FAILURES")
     exit(ok ? 0 : 1)
 }
@@ -80,7 +144,12 @@ if cfg.micLevel != nil || cfg.micOff || !cfg.rawFrames.isEmpty {
     }
 
     let runner = Runner()
-    runner.send(device: device, frames: frames,
+    shutdownAction = { runner.shutdown { exit(0) } }
+    runner.onError = { message in
+        FileHandle.standardError.write("\(message)\n".data(using: .utf8)!)
+        runner.shutdown { exit(1) }
+    }
+    runner.send(device: device, deviceID: cfg.bleID, frames: frames,
                 step: cfg.stepSeconds ?? (cfg.rawFrames.isEmpty ? 0.15 : 1.5)) {
         print("done")
         exit(0)
@@ -92,23 +161,25 @@ if cfg.micLevel != nil || cfg.micOff || !cfg.rawFrames.isEmpty {
 
 if cfg.testMode {
     let sink: ColorSink
-    if let bleName = cfg.bleName {
-        sink = BLESender(nameFilter: bleName, rate: cfg.bleRate, deadband: cfg.bleDeadband)
-    } else {
-        guard let w = WLEDSender(host: cfg.host, port: cfg.port, ledCount: cfg.ledCount) else {
-            exit(1)
-        }
-        sink = w
+    do {
+        sink = try makeColorSink(cfg)
+    } catch {
+        FileHandle.standardError.write("Cannot create output: \(error.localizedDescription)\n".data(using: .utf8)!)
+        exit(1)
     }
-    let spread = cfg.bleName == nil ? 1.0 : 0.0
     let dest = cfg.bleName.map { "ble:\($0)" } ?? "\(cfg.host):\(cfg.port)"
-    print("test mode -> \(dest), \(cfg.ledCount) LEDs. ctrl-c to stop.")
-
-    var phase = 0.0
-    Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { _ in
-        sink.send(hueRamp(count: cfg.ledCount, phase: phase, spread: spread))
-        phase += 0.004
+    print("static layout test -> \(dest), \(cfg.layout.title). ctrl-c to turn off and stop.")
+    let colors: [UInt8]
+    switch cfg.layout {
+    case .whole, .perimeter: colors = [64, 16, 0]
+    case .sides: colors = [64, 0, 0, 0, 0, 64]
+    case .four: colors = [64, 0, 0, 0, 64, 0, 0, 0, 64, 64, 64, 0]
+    case .columns: colors = hueRamp(count: cfg.ledCount, phase: 0, spread: 1).map { $0 / 4 }
     }
+    let frame = expandLightZones(colors, cfg: cfg)
+    sink.send(frame)
+    // The sink holds static output itself; this also exercises WLED's heartbeat.
+    shutdownAction = { sink.shutdown { exit(0) } }
     RunLoop.main.run()
     exit(0)
 }
@@ -116,6 +187,7 @@ if cfg.testMode {
 // MARK: - normal operation
 
 let runner = Runner()
+shutdownAction = { runner.shutdown { exit(0) } }
 runner.onStarted = { info in
     print("ambilight running")
     print(info)
@@ -125,7 +197,7 @@ runner.onError = { msg in
     print("capture failed: \(msg)")
     print("If this is a permission error, grant Screen Recording in")
     print("System Settings > Privacy & Security > Screen Recording.")
-    exit(1)
+    runner.shutdown { exit(1) }
 }
 runner.start(cfg)
 

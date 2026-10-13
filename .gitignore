@@ -3,3 +3,6 @@
 /Ambilight.app/
 /tools/blescan
 .DS_Store
+
+/backups/
+__pycache__/

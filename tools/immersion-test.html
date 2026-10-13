@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ambilight • Movie checks</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif;background:#08090c;color:#edf0f6}
+*{box-sizing:border-box}body{margin:0}header{padding:20px 24px 14px;max-width:1100px;margin:auto}
+h1{font-size:20px;margin:0 0 6px;font-weight:650}p{color:#a8b1c2;font-size:13px;margin:0 0 16px;line-height:1.5}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,select{background:#1c2230;border:1px solid #3b465d;border-radius:8px;padding:9px 12px;color:inherit;font:inherit;font-size:12px;cursor:pointer}button[aria-pressed=true]{background:#d6e6ff;color:#12213b;border-color:#d6e6ff}button:focus-visible,select:focus-visible{outline:2px solid #80bbff;outline-offset:3px}.spacer{flex:1}
+#viewport{height:calc(100vh - 185px);min-height:180px;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#picture{position:relative;flex:none;overflow:hidden;background:#000;isolation:isolate}.quadrant{position:absolute;width:50%;height:50%}.tl{top:0;left:0}.bl{bottom:0;left:0}.tr{top:0;right:0}.br{bottom:0;right:0}
+#highlight{position:absolute;width:7%;height:10%;left:46.5%;top:30%;background:#ffc26d;display:none}#subtitle{display:none;position:absolute;bottom:6%;width:100%;text-align:center;color:white;font-weight:600;font-size:clamp(12px,2.7vw,34px);text-shadow:0 2px 2px #000}
+#center{display:none;position:absolute;left:35%;top:30%;width:30%;height:40%;background:#fff}
+footer{padding:12px 24px;max-width:1100px;margin:auto;color:#a8b1c2;font-size:12px;line-height:1.5}kbd{font:inherit;color:#e2eaff}
+:fullscreen header,:fullscreen footer{display:none}:fullscreen #viewport{height:100vh}#status{color:#d8e5fc}
+</style>
+</head>
+<body>
+<header><h1>Movie lighting checks</h1><p>Change scenes manually, then compare the screen with the wall. Start at low lamp brightness. These checks do not connect to lights.</p>
+<div class="controls" id="scenes">
+<button data-scene="sides">1 · Left / right</button><button data-scene="four">2 · Four regions</button><button data-scene="night">3 · Dark scene</button><button data-scene="subtitles">4 · Subtitles</button><button data-scene="center">5 · Centre highlight</button><button data-scene="black">6 · Black</button><button data-scene="neutral">7 · Neutral</button>
+<span class="spacer"></span><label for="aspect">Picture </label><select id="aspect"><option value="2.35">2.35:1</option><option value="1.77777778">16:9</option><option value="1.33333333">4:3</option></select><button id="swap">Swap sides</button><button id="fullscreen">Fullscreen · F</button>
+</div></header>
+<main id="viewport"><div id="picture"><div class="quadrant tl"></div><div class="quadrant bl"></div><div class="quadrant tr"></div><div class="quadrant br"></div><div id="highlight"></div><div id="center"></div><div id="subtitle">The room should stay dark while this subtitle appears.</div></div></main>
+<footer><span id="status" aria-live="polite"></span><br><kbd>1–7</kbd> select a scene · <kbd>← →</kbd> change scene · <kbd>S</kbd> swap · <kbd>F</kbd> fullscreen · <kbd>Esc</kbd> exit fullscreen. No automatic flashing. The current shared Xergy controller receives one representative colour; four-region checks require an addressable output.</footer>
+<script>
+const scenes=['sides','four','night','subtitles','center','black','neutral'];
+const colors={sides:['#ef251d','#ef251d','#0759eb','#0759eb'],four:['#ed2520','#17b46a','#0659ed','#f6a51c'],night:['#020508','#020508','#020508','#020508'],subtitles:['#020508','#020508','#020508','#020508'],center:['#072439','#072439','#072439','#072439'],black:['#000','#000','#000','#000'],neutral:['#808080','#808080','#808080','#808080']};
+const descriptions={sides:'Left red, right blue. Swap to check bar assignment.',four:'Left: red above green. Right: blue above amber. Check physical direction.',night:'A small warm object on a dark background should not light the entire room brightly.',subtitles:'Compare with Dark scene (3): the white text should have little effect on the wall.',center:'The white centre patch should have little effect when sampling the perimeter.',black:'A full black picture should fade the output down without a stuck colour.',neutral:'Neutral grey helps compare left/right brightness and wall colour.'};
+let current='sides',swapped=false;
+const picture=document.querySelector('#picture'),viewport=document.querySelector('#viewport'),aspect=document.querySelector('#aspect');
+function fit(){const a=Number(aspect.value),w=Math.min(viewport.clientWidth,viewport.clientHeight*a);picture.style.width=w+'px';picture.style.height=w/a+'px'}
+function render(){let c=colors[current];if(swapped)c=[c[2],c[3],c[0],c[1]];document.querySelectorAll('.quadrant').forEach((el,i)=>el.style.background=c[i]);document.querySelector('#highlight').style.display=['night','subtitles'].includes(current)?'block':'none';document.querySelector('#subtitle').style.display=current==='subtitles'?'block':'none';document.querySelector('#center').style.display=current==='center'?'block':'none';document.querySelectorAll('[data-scene]').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.scene===current)));document.querySelector('#status').textContent=descriptions[current]+(swapped?' Sides swapped.':'')}
+function select(scene){current=scene;render()}function swap(){swapped=!swapped;render()}async function fullscreen(){if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen()}
+document.querySelectorAll('[data-scene]').forEach(el=>el.addEventListener('click',()=>select(el.dataset.scene)));document.querySelector('#swap').addEventListener('click',swap);document.querySelector('#fullscreen').addEventListener('click',fullscreen);aspect.addEventListener('change',fit);addEventListener('resize',fit);document.addEventListener('fullscreenchange',fit);
+addEventListener('keydown',e=>{if(e.target.matches('select'))return;const n=Number(e.key);if(n>=1&&n<=7)select(scenes[n-1]);if(e.key==='ArrowRight'||e.key==='ArrowLeft'){e.preventDefault();select(scenes[(scenes.indexOf(current)+(e.key==='ArrowRight'?1:scenes.length-1))%scenes.length])}if(e.key.toLowerCase()==='s')swap();if(e.key.toLowerCase()==='f')fullscreen()});fit();render();
+</script>
+</body>
+</html>
