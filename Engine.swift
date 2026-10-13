@@ -529,6 +529,15 @@ final class Runner: NSObject, SCStreamDelegate {
     private var startTask: Task<Void, Never>?
     private var generation = 0
     private var streamingConfig: Config?
+    // Capture can pause and resume while the output stays connected, so the
+    // lamp keeps a resting colour and resuming does not wait for Bluetooth.
+    private var captureTask: Task<Void, Never>?
+    private var captureToken = 0
+    private var wantCapture = true
+
+    /// Bundle-ID prefixes whose windows never appear in a captured display
+    /// frame. Remote desktops by default: their content is not ours to read.
+    var excludedPrefixes: [String] = GateRules().remotePrefixes
 
     var onStarted: ((String) -> Void)?
     var onError: ((String) -> Void)?
@@ -544,7 +553,10 @@ final class Runner: NSObject, SCStreamDelegate {
         }
     }
 
-    func start(_ proposed: Config) {
+    /// Connect the output and, unless `capture` is false, start capturing.
+    /// A gate passes false and then resumes and pauses capture as windows
+    /// change.
+    func start(_ proposed: Config, capture: Bool = true) {
         stop()
         let cfg: Config
         do { cfg = try validatedConfig(proposed) }
@@ -554,12 +566,48 @@ final class Runner: NSObject, SCStreamDelegate {
             onError?("Allow Ambilight in Privacy & Security → Screen & System Audio Recording, then relaunch.")
             return
         }
-        onOutputStatus?(OutputStatus(state: "Starting capture"))
+        wantCapture = capture
+        onOutputStatus?(OutputStatus(state: capture ? "Starting capture" : "Connecting"))
         startTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
+                let s = try makeColorSink(cfg, onStatus: self.statusCallback(token), onIdentified: { [weak self] id in
+                    guard let self, self.generation == token else { return }; self.onDeviceIdentified?(id)
+                })
+                guard !Task.isCancelled, self.generation == token else { s.stop(); return }
+                self.sink = s
+                self.streamingConfig = cfg
+                self.watcher = SleepWatcher(sink: s)
+                if self.wantCapture { self.launchCapture() }
+            } catch {
+                self.fail(error.localizedDescription, token: token)
+            }
+        }
+    }
+
+    private func fail(_ message: String, token: Int) {
+        guard generation == token, !Task.isCancelled else { return }
+        shutdown { [weak self] in
+            guard let self, self.generation == token + 1 else { return }
+            self.onError?(message)
+        }
+    }
+
+    /// Start the capture stream on the existing output. Idempotent.
+    private func launchCapture() {
+        guard captureTask == nil, stream == nil, let cfg = streamingConfig, let s = sink else { return }
+        let token = generation
+        captureToken += 1
+        let mine = captureToken
+        captureTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.captureToken == mine { self.captureTask = nil } }
+            func live() -> Bool {
+                !Task.isCancelled && self.generation == token && self.captureToken == mine && self.wantCapture
+            }
+            do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard !Task.isCancelled, self.generation == token else { return }
+                guard live() else { return }
                 let filter: SCContentFilter
                 let width: Double, height: Double
                 let sourceName: String
@@ -581,22 +629,19 @@ final class Runner: NSObject, SCStreamDelegate {
                         guard cfg.displayIndex < content.displays.count else { throw ConfigurationError("Display \(cfg.displayIndex) is unavailable") }
                         display = content.displays[cfg.displayIndex]
                     }
-                    filter = SCContentFilter(display: display, excludingWindows: [])
+                    // Remote desktops are left out of every frame.
+                    let excluded = self.excludedPrefixes
+                    let skip = content.applications.filter { app in
+                        excluded.contains { app.bundleIdentifier.hasPrefix($0) }
+                    }
+                    filter = SCContentFilter(display: display, excludingApplications: skip, exceptingWindows: [])
                     width = Double(display.width); height = Double(display.height)
                     sourceName = "Display \(display.displayID)"
                 }
-                let s = try makeColorSink(cfg, onStatus: self.statusCallback(token), onIdentified: { [weak self] id in
-                    guard let self, self.generation == token else { return }; self.onDeviceIdentified?(id)
-                })
-                guard !Task.isCancelled, self.generation == token else { s.stop(); return }
-                self.sink = s
-                self.streamingConfig = cfg
-                self.watcher = SleepWatcher(sink: s)
                 let h = FrameHandler(cfg: cfg, sink: s)
                 h.onPreview = { [weak self] preview in
                     guard let self, self.generation == token else { return }; self.onPreview?(preview)
                 }
-                self.handler = h
                 h.start()
                 let sc = SCStreamConfiguration()
                 sc.width = h.captureWidth
@@ -612,18 +657,47 @@ final class Runner: NSObject, SCStreamDelegate {
                 try st.addStreamOutput(h, type: .screen, sampleHandlerQueue: h.sampleQueue)
                 if cfg.audio { try st.addStreamOutput(h, type: .audio, sampleHandlerQueue: h.sampleQueue) }
                 try await st.startCapture()
-                guard !Task.isCancelled, self.generation == token else { h.stop(); try? await st.stopCapture(); return }
+                // The gate may have paused us while the stream was starting.
+                guard live() else { h.stop(); try? await st.stopCapture(); return }
+                self.handler = h
                 self.stream = st
                 self.onStarted?("source    \(sourceName)\nlayout    \(cfg.layout.title)\ncapture   \(h.captureWidth)x\(h.captureHeight) @ \(cfg.fps)fps\nfeel      \(cfg.profile ?? "custom")")
             } catch {
-                guard self.generation == token, !Task.isCancelled else { return }
-                let message = error.localizedDescription
-                self.shutdown { [weak self] in
-                    guard let self, self.generation == token + 1 else { return }
-                    self.onError?(message)
-                }
+                guard self.generation == token, self.captureToken == mine else { return }
+                self.fail(error.localizedDescription, token: token)
             }
         }
+    }
+
+    /// Stop capturing but keep the output connected. The screen-recording
+    /// indicator goes away, and with it any remote desktop's reason to blank.
+    func pauseCapture() {
+        guard wantCapture || stream != nil || captureTask != nil else { return }
+        wantCapture = false
+        captureToken += 1
+        captureTask?.cancel(); captureTask = nil
+        handler?.stop(); handler = nil
+        if let st = stream { Task { try? await st.stopCapture() } }
+        stream = nil
+    }
+
+    /// Resume capturing on the existing output. Safe to call repeatedly; if the
+    /// output is still connecting, capture starts once it is ready.
+    func resumeCapture() {
+        wantCapture = true
+        launchCapture()
+    }
+
+    /// Show a fixed colour through the live output while capture is paused,
+    /// with the same calibration and master brightness as the picture.
+    func hold(_ color: [UInt8]) {
+        guard stream == nil, captureTask == nil, let cfg = streamingConfig, let s = sink else { return }
+        let count = cfg.layout.zoneCount(ledCount: cfg.ledCount)
+        var raw = [Double]()
+        for _ in 0..<count { raw += color.map { Double($0) / 255 } }
+        var restCfg = cfg; restCfg.normalize = 0; restCfg.saturation = 1; restCfg.blackPoint = 0
+        var pipeline = ColorPipeline(cfg: restCfg)
+        s.send(expandLightZones(pipeline.process(raw, snap: true), cfg: cfg))
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -640,6 +714,9 @@ final class Runner: NSObject, SCStreamDelegate {
     private func endCapture() {
         generation += 1
         startTask?.cancel(); startTask = nil
+        captureToken += 1
+        captureTask?.cancel(); captureTask = nil
+        wantCapture = true
         handler?.stop()
         if let st = stream { Task { try? await st.stopCapture() } }
         stream = nil; handler = nil; watcher = nil; streamingConfig = nil

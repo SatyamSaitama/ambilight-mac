@@ -275,6 +275,41 @@ func runImmersionTests() -> Bool {
     check("busy scenes change colour faster than calm ones",
           quickOut[2] > calmOut[2] && quickOut[0] < calmOut[0], "calm \(calmOut) / busy \(quickOut)")
 
+    print("capture gate:")
+    let mon = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    let lap = CGRect(x: 1920, y: 0, width: 1512, height: 982)
+    let rules = GateRules()
+    func win(_ id: String, _ owner: String, _ title: String, _ r: CGRect, number: UInt32 = 0) -> GateWindow {
+        GateWindow(id: number, bundleID: id, owner: owner, title: title, bounds: r)
+    }
+    let stremio = win("com.westbridge.stremio5-mac", "Stremio", "Stremio", mon, number: 42)
+    let citrix  = win("com.citrix.receiver.icaviewer.mac", "Citrix Viewer", "Desktop", lap)
+    let term    = win("com.apple.Terminal", "Terminal", "zsh", mon)
+    func gate(_ name: String, _ p: GatePolicy, _ ws: [GateWindow], _ want: GateDecision, windowID: UInt32? = nil) {
+        let got = gateDecision(policy: p, rules: rules, windows: ws, display: mon, windowID: windowID)
+        check(name, got == want, got.summary)
+    }
+    gate("a player on top is followed", .players, [stremio], .capture("Stremio"))
+    gate("a YouTube tab is followed", .players,
+         [win("com.google.Chrome", "Google Chrome", "lofi beats - YouTube", mon)], .capture("YouTube in Google Chrome"))
+    gate("an ordinary tab is not", .players,
+         [win("com.google.Chrome", "Google Chrome", "Inbox - Gmail", mon)], .idle)
+    gate("a work window over the film pauses it", .players, [term, stremio], .idle)
+    gate("a small window over the film does not", .players,
+         [win("com.apple.Notes", "Notes", "x", CGRect(x: 100, y: 100, width: 300, height: 200)), stremio], .capture("Stremio"))
+    gate("typing on the laptop keeps the film followed", .players,
+         [win("com.apple.Terminal", "Terminal", "zsh", lap), stremio], .capture("Stremio"))
+    gate("a visible Citrix session pauses even a film", .players, [citrix, stremio], .blocked("Citrix Viewer"))
+    gate("a tiny Citrix helper window is ignored", .players,
+         [win("com.citrix.receiver.nomas", "Citrix Workspace", "", CGRect(x: 1920, y: 0, width: 60, height: 40)), stremio],
+         .capture("Stremio"))
+    gate("a chosen player window is followed wherever it is", .players,
+         [term, stremio], .capture("Stremio"), windowID: 42)
+    gate("a chosen window that has closed waits", .players, [term], .idle, windowID: 42)
+    gate("ambient follows the screen without Citrix", .exceptRemote, [term], .capture("screen"))
+    gate("ambient pauses for Citrix", .exceptRemote, [citrix, term], .blocked("Citrix Viewer"))
+    gate("always ignores Citrix", .always, [citrix], .capture("screen"))
+
     print("crop, calibration and picture bounds:")
     cfg.layout = .whole; cfg.bleName = nil; cfg.vividness = 0; cfg.excludeSubtitles = false
     cfg.cropRect = CGRect(x: 0.5, y: 0, width: 0.5, height: 1)

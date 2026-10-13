@@ -74,6 +74,11 @@ private struct AppSettings: Codable {
     var dominantColour: Bool? = true
     /// Calm in quiet scenes, quick in action. Flashes stay instant either way.
     var sceneAware: Bool? = true
+    /// Movie modes capture only while a video player is on screen. Either way
+    /// capture pauses while Citrix or another remote desktop is visible.
+    var onlyPlayers: Bool? = true
+    /// What the lamp shows while nothing is being followed.
+    var idle: String? = "warm"
     var gamma = 1.6
     var audioDepth = 0.15
     var edgeDepth = 0.20
@@ -171,6 +176,10 @@ private final class ZonePreview: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let runner = Runner()
+    /// Pauses capture while nothing worth following is on screen, and always
+    /// while a remote desktop is visible.
+    private lazy var gate = GateController(runner: runner)
+    private var gateText: String?
     private let discovery = BLEDiscovery()
     private var settings = AppSettings.load()
     private let previewOnly = CommandLine.arguments.contains("--ui-preview")
@@ -203,6 +212,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var lampDimmingToggle = NSButton(checkboxWithTitle: "Let the lamp do the dimming (finer steps in dark scenes)", target: nil, action: nil)
     private var dominantToggle = NSButton(checkboxWithTitle: "Pick the dominant colour (keeps sunsets warm, avoids muddy mixes)", target: nil, action: nil)
     private var sceneAwareToggle = NSButton(checkboxWithTitle: "Adapt to the scene (calm in quiet moments, quick in action)", target: nil, action: nil)
+    private var playersToggle = NSButton(checkboxWithTitle: "Light up only while a video player is in front", target: nil, action: nil)
+    private var idlePicker = NSPopUpButton()
     private var reverseLeftToggle = NSButton(checkboxWithTitle: "Reverse left bar", target: nil, action: nil)
     private var reverseRightToggle = NSButton(checkboxWithTitle: "Reverse right bar", target: nil, action: nil)
     private var swapToggle = NSButton(checkboxWithTitle: "Swap left and right outputs", target: nil, action: nil)
@@ -264,6 +275,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.statusLabel.textColor = status.connected ? .systemGreen : .secondaryLabelColor
             self.buildMenu()
         }
+        gate.onChange = { [weak self] decision in
+            guard let self else { return }
+            self.log("Gate: \(decision.summary)")
+            self.gateText = decision.summary
+            if case .capture = decision {} else { self.metricsLabel.stringValue = decision.summary }
+            self.buildMenu()
+        }
         runner.onPreview = { [weak self] frame in
             guard let self else { return }
             self.preview.colors = frame.colors; self.preview.labels = frame.labels
@@ -296,6 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if shuttingDown { return .terminateLater }
         shuttingDown = true; launchGeneration += 1; discovery.stop()
         if previewOnly { return .terminateNow }
+        gate.disable()
         runner.shutdown { DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) } }
         return .terminateLater
     }
@@ -317,6 +336,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         let state = NSMenuItem(title: String((lastError ?? connectionText).prefix(95)), action: nil, keyEquivalent: "")
         state.isEnabled = false; menu.addItem(state)
+        if settings.mode.isStreaming, lastError == nil, let g = gateText {
+            let gateItem = NSMenuItem(title: g, action: nil, keyEquivalent: "")
+            gateItem.isEnabled = false; menu.addItem(gateItem)
+        }
         for (title, selector, key) in [("Settings…", #selector(showSettings), ","), ("Reconnect", #selector(restart), "r"), ("Open Log", #selector(openLog), "l")] {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
             item.target = self; menu.addItem(item)
@@ -341,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         launchGeneration += 1
         let generation = launchGeneration
         let config = settings.configuration()
-        discovery.stop(); runner.stop()
+        discovery.stop(); gate.disable(); runner.stop(); gateText = nil
         connectionText = "Preparing \(mode.title.lowercased())"
         statusLabel.stringValue = connectionText; statusLabel.textColor = .secondaryLabelColor
         metricsLabel.stringValue = mode.isStreaming ? "Waiting for capture" : "Static output · no capture"
@@ -349,7 +372,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Release a previous controller connection before the next session.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self, self.launchGeneration == generation, !self.shuttingDown else { return }
-            if mode.isStreaming { self.runner.start(config) }
+            if mode.isStreaming {
+                // Connect the lamp now; the gate starts and stops capture.
+                self.runner.start(config, capture: false)
+                self.gate.rules = GateRules.withUserAdditions()
+                self.runner.excludedPrefixes = self.gate.rules.remotePrefixes
+                self.gate.idle = IdleBehaviour(rawValue: self.settings.idle ?? "warm") ?? .warm
+                let playersOnly = mode != .ambient && (self.settings.onlyPlayers ?? true)
+                self.gate.enable(policy: playersOnly ? .players : .exceptRemote,
+                                 displayID: config.displayID, displayIndex: config.displayIndex,
+                                 windowID: config.windowID)
+            }
             else { self.runner.setStatic(config, color: mode == .off ? [0, 0, 0] : [255, 169, 87], off: mode == .off) }
             self.buildMenu()
         }
@@ -452,10 +485,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         letterboxToggle.state = settings.letterbox ? .on : .off
         subtitleToggle.state = settings.excludeSubtitles ? .on : .off
+        playersToggle.state = (settings.onlyPlayers ?? true) ? .on : .off
+        playersToggle.target = self; playersToggle.action = #selector(toggleChanged)
+        idlePicker.removeAllItems(); idlePicker.addItems(withTitles: IdleBehaviour.allCases.map(\.title))
+        let idle = IdleBehaviour(rawValue: settings.idle ?? "warm") ?? .warm
+        idlePicker.selectItem(at: IdleBehaviour.allCases.firstIndex(of: idle) ?? 0)
+        idlePicker.target = self; idlePicker.action = #selector(toggleChanged)
         return pane([row("Capture", controls), sourceNote, cropToggle, cropRow,
                      note("Crop uses fractions from 0 to 1, measured from the top-left of the selected source. The crop must fit inside it."),
                      letterboxToggle, subtitleToggle,
-                     note("For movies, select the player window or a clean external display. Protected video may appear black to macOS screen capture.")])
+                     note("For movies, select the player window or a clean external display. Protected video may appear black to macOS screen capture."),
+                     playersToggle, row("When nothing plays", idlePicker),
+                     note("Capture runs only while Stremio, QuickTime, TV, IINA, VLC or a video site in a browser is the top window on the movie display, so the recording indicator is off the rest of the time. Capture always pauses while a Citrix or other remote-desktop window is visible: those blank their session whenever any app is capturing the screen.")])
     }
     private func lightsPane() -> NSView {
         outputPicker.addItems(withTitles: LightOutput.allCases.map(\.title))
@@ -723,6 +764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.lampDimming = lampDimmingToggle.state == .on
         next.dominantColour = dominantToggle.state == .on
         next.sceneAware = sceneAwareToggle.state == .on
+        next.onlyPlayers = playersToggle.state == .on
+        next.idle = IdleBehaviour.allCases[max(0, idlePicker.indexOfSelectedItem)].rawValue
         next.excludeSubtitles = subtitleToggle.state == .on; next.letterbox = letterboxToggle.state == .on
         for index in 0..<2 {
             let values = gainFields[index].compactMap { Double($0.stringValue) }

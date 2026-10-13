@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 stage=$(mktemp -d "${TMPDIR:-/tmp/}ambilight-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-shared=(Engine.swift Configuration.swift Output.swift Cinema.swift)
+shared=(Engine.swift Configuration.swift Output.swift Cinema.swift Gate.swift)
 
 echo "Building CLI and regression suite"
 swiftc -O "${shared[@]}" SelfTests.swift main.swift -o "$stage/ambilight"
