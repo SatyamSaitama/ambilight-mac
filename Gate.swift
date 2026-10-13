@@ -60,13 +60,15 @@ struct GateWindow {
 enum GateDecision: Equatable {
     case capture(String)    // what is being followed
     case blocked(String)    // a remote desktop is visible
+    case protected(String)  // DRM video is visible
     case idle               // nothing worth following
 
     var summary: String {
         switch self {
-        case .capture(let r): return r == "screen" ? "Following the screen" : "Following \(r)"
-        case .blocked(let r): return "Paused · \(r) is on screen"
-        case .idle:           return "Waiting for a video player"
+        case .capture(let r):   return r == "screen" ? "Following the screen" : "Following \(r)"
+        case .blocked(let r):   return "Paused · \(r) is on screen"
+        case .protected(let r): return "Protected video · \(r) can't be followed"
+        case .idle:             return "Waiting for a video player"
         }
     }
 }
@@ -83,10 +85,19 @@ struct GateRules {
         "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser",
         "com.microsoft.edgemac", "org.mozilla.firefox", "com.brave.Browser",
     ]
-    var titleKeywords: [String] = [
-        "YouTube", "Netflix", "Prime Video", "Disney+", "Hotstar", "JioCinema",
-        "SonyLIV", "ZEE5", "Twitch", "Crunchyroll", "Stremio", "Vimeo",
+    /// Video sites without DRM, which capture can actually see.
+    var titleKeywords: [String] = ["YouTube", "Twitch", "Vimeo", "Stremio"]
+
+    /// DRM video. Capture cannot see it -- Safari shows it to you but black to
+    /// capture -- and Chrome goes further and blacks it out *for you* while
+    /// any app is capturing the screen. So capturing it is useless at best
+    /// and breaks playback at worst. Measured on Crunchyroll in Safari: the
+    /// picture read 0-3 out of 255 to capture throughout playback.
+    var protectedKeywords: [String] = [
+        "Netflix", "Prime Video", "Disney+", "Hotstar", "JioCinema",
+        "SonyLIV", "ZEE5", "Crunchyroll", "Apple TV+",
     ]
+    var protectedApps: Set<String> = ["com.apple.TV"]
     /// Remote-desktop clients with screen-capture protection.
     var remotePrefixes: [String] = [
         "com.citrix.", "com.microsoft.rdc.", "com.vmware.horizon",
@@ -94,6 +105,16 @@ struct GateRules {
     ]
 
     func isRemote(_ id: String) -> Bool { remotePrefixes.contains { id.hasPrefix($0) } }
+
+    /// A label for the window if it shows DRM-protected video, else nil.
+    func protectedLabel(_ w: GateWindow) -> String? {
+        if protectedApps.contains(w.bundleID) { return w.owner }
+        if browsers.contains(w.bundleID),
+           let k = protectedKeywords.first(where: { w.title.localizedCaseInsensitiveContains($0) }) {
+            return "\(k) in \(w.owner)"
+        }
+        return nil
+    }
 
     /// A label for the window if it is a video player, else nil.
     func playerLabel(_ w: GateWindow) -> String? {
@@ -112,6 +133,7 @@ struct GateRules {
         r.players.formUnion(defaults.stringArray(forKey: "extraPlayers") ?? [])
         r.titleKeywords += defaults.stringArray(forKey: "extraTitleKeywords") ?? []
         r.remotePrefixes += defaults.stringArray(forKey: "extraRemotePrefixes") ?? []
+        r.protectedKeywords += defaults.stringArray(forKey: "extraProtectedKeywords") ?? []
         return r
     }
 }
@@ -131,6 +153,13 @@ func gateDecision(policy: GatePolicy, rules: GateRules, windows: [GateWindow],
         rules.isRemote($0.bundleID) && $0.bounds.width >= 120 && $0.bounds.height >= 80
     }) {
         return .blocked(r.owner)
+    }
+    // Visible DRM video also stops capture, wherever it is: Chrome blanks it
+    // for the viewer while any capture runs, not only when it is the source.
+    if let p = windows.first(where: {
+        $0.bounds.width >= 400 && $0.bounds.height >= 300 && rules.protectedLabel($0) != nil
+    }), let label = rules.protectedLabel(p) {
+        return .protected(label)
     }
     if policy == .exceptRemote { return .capture("screen") }
 

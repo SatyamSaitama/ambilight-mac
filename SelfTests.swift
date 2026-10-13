@@ -306,6 +306,17 @@ func runImmersionTests() -> Bool {
     gate("a chosen player window is followed wherever it is", .players,
          [term, stremio], .capture("Stremio"), windowID: 42)
     gate("a chosen window that has closed waits", .players, [term], .idle, windowID: 42)
+    let crunchyChrome = win("com.google.Chrome", "Google Chrome", "Episode 3 - Crunchyroll", mon)
+    gate("DRM video in Chrome is never captured", .players, [crunchyChrome], .protected("Crunchyroll in Google Chrome"))
+    gate("DRM video in Safari is never captured", .players,
+         [win("com.apple.Safari", "Safari", "Netflix", mon)], .protected("Netflix in Safari"))
+    gate("the TV app counts as protected", .players,
+         [win("com.apple.TV", "TV", "Movie", mon)], .protected("TV"))
+    gate("visible DRM video stops even a followed film", .players,
+         [stremio, win("com.google.Chrome", "Google Chrome", "Crunchyroll", lap)], .protected("Crunchyroll in Google Chrome"))
+    gate("ambient also leaves DRM video alone", .exceptRemote, [crunchyChrome], .protected("Crunchyroll in Google Chrome"))
+    gate("YouTube is still followed", .players,
+         [win("com.google.Chrome", "Google Chrome", "Trailer - YouTube", mon)], .capture("YouTube in Google Chrome"))
     gate("ambient follows the screen without Citrix", .exceptRemote, [term], .capture("screen"))
     gate("ambient pauses for Citrix", .exceptRemote, [citrix, term], .blocked("Citrix Viewer"))
     gate("always ignores Citrix", .always, [citrix], .capture("screen"))
