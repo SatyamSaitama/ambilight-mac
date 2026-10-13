@@ -213,6 +213,68 @@ func runImmersionTests() -> Bool {
     var wled = lamp; wled.bleName = nil
     check("WLED is always dimmed in software", settled(wled, [1, 1, 1], 1) == [89, 89, 89])
 
+    print("dominant colour and scene activity:")
+    var dom = Config()
+    dom.bleName = nil; dom.layout = .whole; dom.excludeSubtitles = false
+    dom.letterbox = false; dom.vividness = 0.45; dom.ledCount = 7
+    var domOn = dom; domOn.dominantColour = true
+    func zones(_ bytes: [UInt8], _ c: Config) -> ZoneSamples {
+        sampleLightZones(bgra: bytes, width: 80, height: 60, cfg: c)
+    }
+    func show(_ c: [Double]) -> String { c.map { String(format: "%.2f", $0) }.joined(separator: ",") }
+
+    // 60% orange sky, 30% purple cloud, 10% dark silhouette.
+    let sunset = frame { x, _ in x < 48 ? (255, 120, 20) : x < 72 ? (120, 40, 170) : (10, 10, 10) }
+    let mixed = zones(sunset, dom).colors, warmSunset = zones(sunset, domOn).colors
+    let blueToRed = { (c: [Double]) in c[2] / max(0.001, c[0]) }
+    check("dominant colour keeps a sunset warm",
+          blueToRed(warmSunset) < 0.6 * blueToRed(mixed), "\(show(mixed)) -> \(show(warmSunset))")
+
+    func twoColour(_ redColumns: Int) -> [UInt8] {
+        frame { x, _ in x < redColumns ? (230, 40, 40) : (40, 40, 230) }
+    }
+    let even = zones(twoColour(40), domOn).colors, nudged = zones(twoColour(42), domOn).colors
+    check("near-equal hues shift smoothly instead of flipping",
+          zip(even, nudged).allSatisfy { abs($0 - $1) < 0.1 }, "\(show(even)) / \(show(nudged))")
+
+    let grey = frame { _, _ in (128, 128, 128) }
+    check("dominant colour leaves a neutral picture alone",
+          approximately(zones(grey, domOn).colors, zones(grey, dom).colors, tolerance: 0.001))
+    check("dominant colour never changes brightness",
+          approximately(zones(sunset, domOn).luminances, zones(sunset, dom).luminances, tolerance: 0.0001))
+
+    var aware = dom; aware.sceneAware = true
+    check("scene-aware sampling returns the motion grid",
+          zones(sunset, aware).motion.count == motionColumns * motionRows)
+    check("no motion grid unless scene-aware is on", zones(sunset, dom).motion.isEmpty)
+
+    let flat = [Double](repeating: 0.3, count: motionColumns * motionRows)
+    var still = SceneActivity(), action = SceneActivity(), cutOnly = SceneActivity()
+    for i in 0..<60 {
+        still.update(grid: flat, deltaTime: 1.0 / 30, cut: false)
+        // A checkerboard that inverts every frame: constant heavy motion.
+        let moving = flat.indices.map { ($0 + i) % 2 == 0 ? 0.2 : 0.4 }
+        action.update(grid: moving, deltaTime: 1.0 / 30, cut: false)
+        cutOnly.update(grid: flat, deltaTime: 1.0 / 30, cut: false)
+    }
+    cutOnly.update(grid: flat.map { _ in 0.9 }, deltaTime: 1.0 / 30, cut: true)
+    check("a still picture reads as calm",
+          still.busy == 0 && still.pace.colour > 1.7, String(format: "pace %.2f", still.pace.colour))
+    check("constant motion reads as busy",
+          action.busy > 0.95 && action.pace.colour < 0.6, String(format: "pace %.2f", action.pace.colour))
+    check("a scene cut is not mistaken for action", cutOnly.busy == 0)
+
+    var calmP = ColorPipeline(cfg: env), quickP = ColorPipeline(cfg: env)
+    _ = calmP.process([0.9, 0.1, 0.1], luminances: [0.27], snap: true)
+    _ = quickP.process([0.9, 0.1, 0.1], luminances: [0.27], snap: true)
+    var calmOut: [UInt8] = [], quickOut: [UInt8] = []
+    for _ in 0..<6 {
+        calmOut = calmP.process([0.1, 0.1, 0.9], luminances: [0.16], deltaTime: 1.0 / 60, pace: still.pace)
+        quickOut = quickP.process([0.1, 0.1, 0.9], luminances: [0.16], deltaTime: 1.0 / 60, pace: action.pace)
+    }
+    check("busy scenes change colour faster than calm ones",
+          quickOut[2] > calmOut[2] && quickOut[0] < calmOut[0], "calm \(calmOut) / busy \(quickOut)")
+
     print("crop, calibration and picture bounds:")
     cfg.layout = .whole; cfg.bleName = nil; cfg.vividness = 0; cfg.excludeSubtitles = false
     cfg.cropRect = CGRect(x: 0.5, y: 0, width: 0.5, height: 1)

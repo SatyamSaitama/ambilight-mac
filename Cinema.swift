@@ -52,6 +52,23 @@ struct ZoneSamples {
     /// Unweighted luma preserves scene darkness even when chroma is emphasized.
     let luminances: [Double]
     let pictureRect: CGRect
+    /// Coarse luma grid of the picture, for measuring how much it moves.
+    /// Empty unless scene-aware response is on.
+    var motion: [Double] = []
+}
+
+/// Grid used to measure scene activity: coarse enough to ignore grain and
+/// compression noise, fine enough to see a fight move across the frame.
+let motionColumns = 8, motionRows = 6
+private let hueBins = 24
+
+/// Hue bin of a pixel with nonzero chroma, 0..<hueBins.
+@inline(__always)
+private func hueBin(_ r: Double, _ g: Double, _ b: Double, max mx: Double, chroma: Double) -> Int {
+    var h: Double
+    if mx == r { h = (g - b) / chroma } else if mx == g { h = 2 + (b - r) / chroma } else { h = 4 + (r - g) / chroma }
+    if h < 0 { h += 6 }
+    return min(hueBins - 1, max(0, Int(h / 6 * Double(hueBins))))
 }
 
 private let fullPicture = CGRect(x: 0, y: 0, width: 1, height: 1)
@@ -97,37 +114,105 @@ private func sampleLightZones(_ bytes: UnsafePointer<UInt8>, width: Int, height:
     var brightness = [Double](repeating: 0, count: count)
     var pixels = [Int](repeating: 0, count: count)
     let depth = max(0.05, min(0.5, cfg.edgeDepth))
+
+    /// Which zone a picture-relative point feeds, or nil if it is not sampled.
+    func zoneAt(_ nx: Double, _ ny: Double) -> Int? {
+        switch cfg.layout {
+        case .whole: return 0
+        case .perimeter:
+            guard nx < depth || nx >= 1 - depth || ny < depth || ny >= 1 - depth else { return nil }
+            return 0
+        case .sides, .four:
+            guard nx < depth || nx >= 1 - depth else { return nil }
+            let side = nx < depth ? 0 : 1
+            return cfg.layout == .four ? side * 2 + (ny < 0.5 ? 0 : 1) : side
+        case .columns:
+            guard ny <= max(0.01, min(1, cfg.regionHeight)) else { return nil }
+            return min(count - 1, Int(nx * Double(count)))
+        }
+    }
+    // A configurable geometric mask, not text recognition. Side edges remain sampled.
+    func isSubtitleArea(_ nx: Double, _ ny: Double) -> Bool {
+        cfg.excludeSubtitles && ny >= 0.80 && nx >= 0.20 && nx <= 0.80
+    }
+    // Below this chroma a pixel's hue is mostly noise, so it neither votes nor
+    // is reweighted.
+    let hueFloor = 0.08
+
+    // Dominant colour, pass one: a hue histogram per zone, weighted by chroma
+    // squared so vivid pixels vote and washed-out ones barely do.
+    var popularity: [Double] = []
+    if cfg.dominantColour {
+        var hist = [Double](repeating: 0, count: count * hueBins)
+        for y in y0..<y1 {
+            let ny = (Double(y - y0) + 0.5) / Double(y1 - y0)
+            for x in x0..<x1 {
+                let nx = (Double(x - x0) + 0.5) / Double(x1 - x0)
+                if isSubtitleArea(nx, ny) { continue }
+                guard let zone = zoneAt(nx, ny) else { continue }
+                let p = bytes + y * bytesPerRow + x * 4
+                let r = Double(p[2]) / 255, g = Double(p[1]) / 255, b = Double(p[0]) / 255
+                let mx = max(r, max(g, b)), chroma = mx - min(r, min(g, b))
+                guard chroma > hueFloor else { continue }
+                hist[zone * hueBins + hueBin(r, g, b, max: mx, chroma: chroma)] += chroma * chroma
+            }
+        }
+        // Smooth around the colour wheel so a hue on a bin edge is not
+        // penalized, then scale so the most popular hue family is 1.
+        popularity = [Double](repeating: 1, count: count * hueBins)
+        for z in 0..<count {
+            var smoothed = [Double](repeating: 0, count: hueBins)
+            for i in 0..<hueBins {
+                let prev = hist[z * hueBins + (i + hueBins - 1) % hueBins]
+                let next = hist[z * hueBins + (i + 1) % hueBins]
+                smoothed[i] = 0.25 * prev + 0.5 * hist[z * hueBins + i] + 0.25 * next
+            }
+            let top = smoothed.max() ?? 0
+            guard top > 0 else { continue }
+            for i in 0..<hueBins { popularity[z * hueBins + i] = smoothed[i] / top }
+        }
+    }
+
+    var motion = [Double](repeating: 0, count: cfg.sceneAware ? motionColumns * motionRows : 0)
+    var motionCounts = [Int](repeating: 0, count: motion.count)
+
     for y in y0..<y1 {
         let ny = (Double(y - y0) + 0.5) / Double(y1 - y0)
         for x in x0..<x1 {
             let nx = (Double(x - x0) + 0.5) / Double(x1 - x0)
-            // A configurable geometric mask, not text recognition. Side edges remain sampled.
-            if cfg.excludeSubtitles && ny >= 0.80 && nx >= 0.20 && nx <= 0.80 { continue }
-            let zone: Int
-            switch cfg.layout {
-            case .whole: zone = 0
-            case .perimeter:
-                guard nx < depth || nx >= 1 - depth || ny < depth || ny >= 1 - depth else { continue }
-                zone = 0
-            case .sides, .four:
-                guard nx < depth || nx >= 1 - depth else { continue }
-                let side = nx < depth ? 0 : 1
-                zone = cfg.layout == .four ? side * 2 + (ny < 0.5 ? 0 : 1) : side
-            case .columns:
-                guard ny <= max(0.01, min(1, cfg.regionHeight)) else { continue }
-                zone = min(count - 1, Int(nx * Double(count)))
-            }
+            if isSubtitleArea(nx, ny) { continue }
             let p = bytes + y * bytesPerRow + x * 4
             let r = Double(p[2]) / 255, g = Double(p[1]) / 255, b = Double(p[0]) / 255
-            let weight = chromaWeight(r * 255, g * 255, b * 255, unit(cfg.vividness))
+            let l = luma(r, g, b)
+            if !motion.isEmpty {
+                let cell = min(motionRows - 1, Int(ny * Double(motionRows))) * motionColumns
+                    + min(motionColumns - 1, Int(nx * Double(motionColumns)))
+                motion[cell] += l; motionCounts[cell] += 1
+            }
+            guard let zone = zoneAt(nx, ny) else { continue }
+            var weight = chromaWeight(r * 255, g * 255, b * 255, unit(cfg.vividness))
+            if !popularity.isEmpty {
+                // Dominant colour, pass two: hues that are common in this zone
+                // keep their weight, rare ones fade. A sunset stays warm instead
+                // of averaging orange sky and purple cloud into mauve. This is
+                // continuous in the proportions, unlike picking the largest
+                // cluster, which would flip between two near-equal hues and
+                // make the lamp flicker.
+                let mx = max(r, max(g, b)), chroma = mx - min(r, min(g, b))
+                if chroma > hueFloor {
+                    let pop = popularity[zone * hueBins + hueBin(r, g, b, max: mx, chroma: chroma)]
+                    weight *= pop * pop * pop
+                }
+            }
             sums[zone * 3] += r * weight
             sums[zone * 3 + 1] += g * weight
             sums[zone * 3 + 2] += b * weight
             weights[zone] += weight
-            brightness[zone] += luma(r, g, b)
+            brightness[zone] += l
             pixels[zone] += 1
         }
     }
+    for i in motion.indices where motionCounts[i] > 0 { motion[i] /= Double(motionCounts[i]) }
     for z in 0..<count where pixels[z] > 0 {
         brightness[z] /= Double(pixels[z])
         for channel in 0..<3 { sums[z * 3 + channel] /= weights[z] }
@@ -158,7 +243,7 @@ private func sampleLightZones(_ bytes: UnsafePointer<UInt8>, width: Int, height:
             }
         }
     }
-    return ZoneSamples(colors: sums, luminances: brightness, pictureRect: rect)
+    return ZoneSamples(colors: sums, luminances: brightness, pictureRect: rect, motion: motion)
 }
 
 private func orderedZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
@@ -229,6 +314,48 @@ func expandLightZones(_ colors: [UInt8], cfg: Config) -> [UInt8] {
     return result
 }
 
+// MARK: - Scene activity
+
+/// How much the picture is moving, as mean luma change per second on the
+/// motion grid. Drives scene-aware response: calm while a scene is still,
+/// quick while it is busy.
+struct SceneActivity {
+    /// Luma change per second treated as fully still and fully busy. A static
+    /// shot with grain sits near 0.05, dialogue around 0.1-0.2, a walking
+    /// shot or pan around 0.5, a fight above 1.
+    static let quietRate = 0.15, busyRate = 0.9
+    private(set) var rate = 0.0
+    private var previous: [Double]?
+
+    /// Feed one motion grid. Cuts are not action: a cut changes every cell at
+    /// once, so it is skipped rather than counted as a burst of motion.
+    mutating func update(grid: [Double], deltaTime dt: Double, cut: Bool) {
+        defer { previous = grid }
+        guard let prev = previous, prev.count == grid.count, !grid.isEmpty, !cut, dt > 0 else { return }
+        let change = zip(prev, grid).reduce(0.0) { $0 + abs($1.0 - $1.1) } / Double(grid.count)
+        let observed = change / max(1.0 / 240, dt)
+        // Notice action quickly; settle back to calm slowly, so a pause inside
+        // a fight does not drop straight into slow mode.
+        decay(toward: observed, deltaTime: dt, rise: 0.25, fall: 1.5)
+    }
+
+    /// No new frame arrived: a still screen is calm.
+    mutating func idle(deltaTime dt: Double) { decay(toward: 0, deltaTime: dt, rise: 0.25, fall: 1.5) }
+
+    private mutating func decay(toward target: Double, deltaTime dt: Double, rise: Double, fall: Double) {
+        let tau = target > rate ? rise : fall
+        rate += (target - rate) * (1 - exp(-dt / tau))
+    }
+
+    /// 0 when still, 1 when busy.
+    var busy: Double { unit((rate - Self.quietRate) / (Self.busyRate - Self.quietRate)) }
+
+    /// Multipliers on the colour response and the afterglow. Quiet scenes drift
+    /// gently and glow longer; busy ones track fast and let go quickly.
+    /// Brightness attack is never slowed -- a flash must still land at once.
+    var pace: (colour: Double, release: Double) { (1.8 - 1.3 * busy, 1.3 - 0.7 * busy) }
+}
+
 // MARK: - Time-based cinematic color processing
 
 struct ColorPipeline {
@@ -256,7 +383,8 @@ struct ColorPipeline {
     ///   cut to a darker shot eases down instead of blinking.
     mutating func process(_ raw: [Double], luminances: [Double]? = nil,
                           deltaTime: Double = 1.0 / 60.0, snap: Bool = false,
-                          cut: Bool = false) -> [UInt8] {
+                          cut: Bool = false,
+                          pace: (colour: Double, release: Double) = (1, 1)) -> [UInt8] {
         let n = raw.count / 3
         guard n > 0 else { return [] }
         if chroma.count != n * 3 {
@@ -271,13 +399,14 @@ struct ColorPipeline {
             let alpha = max(0.0001, min(0.9999, cfg.smoothing))
             tau = -(1.0 / 60.0) / log(1 - alpha)
         }
+        tau *= max(0.1, pace.colour)
         let zeroResponse = cfg.responseTime == 0 && !cfg.explicit.contains("--smoothing")
         let alpha = snap || cut || zeroResponse ? 1 : 1 - exp(-dt / tau)
         func envelope(_ t: Double) -> Double { snap || t <= 0 ? 1 : 1 - exp(-dt / t) }
         // Brightness never rises slower than colour moves, so a zero response
         // time still means immediate.
         let attack = envelope(zeroResponse ? 0 : min(cfg.attackTime, tau))
-        let release = envelope(cfg.releaseTime)
+        let release = envelope(cfg.releaseTime * max(0.1, pace.release))
 
         // With lamp-side dimming the master brightness is applied by the
         // controller, so colour goes out at full range. WLED has no such
@@ -389,6 +518,8 @@ final class FrameHandler: NSObject, SCStreamOutput {
     private var lastOutputTime: Double?
     private var latestSamples: ZoneSamples?
     private var pendingCut = false
+    private var activity = SceneActivity()
+    private var lastMotionTime: Double?
     private var samplingMS = 0.0
     private var outputTimer: DispatchSourceTimer?
     private var stopped = false
@@ -452,6 +583,12 @@ final class FrameHandler: NSObject, SCStreamOutput {
             pendingCut = pendingCut || difference / Double(previous.count) > cfg.cutThreshold
         }
         prevRaw = samples.colors
+        if cfg.sceneAware && !samples.motion.isEmpty {
+            let now = ProcessInfo.processInfo.systemUptime
+            activity.update(grid: samples.motion,
+                            deltaTime: lastMotionTime.map { now - $0 } ?? 0, cut: pendingCut)
+            lastMotionTime = now
+        }
         latestSamples = samples
     }
 
@@ -591,8 +728,15 @@ final class FrameHandler: NSObject, SCStreamOutput {
         let started = ProcessInfo.processInfo.systemUptime
         let dt = lastOutputTime.map { max(0, started - $0) } ?? 1.0 / Double(max(1, cfg.fps))
         lastOutputTime = started
+        var pace: (colour: Double, release: Double) = (1, 1)
+        if cfg.sceneAware {
+            // Capture delivers nothing while the screen is still, so let a
+            // quiet stretch read as calm instead of freezing the last estimate.
+            if let t = lastMotionTime, started - t > 0.25 { activity.idle(deltaTime: dt) }
+            pace = activity.pace
+        }
         var colors = pipeline.process(samples.colors, luminances: samples.luminances,
-                                      deltaTime: dt, cut: pendingCut)
+                                      deltaTime: dt, cut: pendingCut, pace: pace)
         pendingCut = false
         if cfg.audio {
             audioLock.lock()

@@ -70,6 +70,10 @@ private struct AppSettings: Codable {
     var afterglow: Double? = 0.8
     /// Master brightness applied by the lamp instead of in software.
     var lampDimming: Bool? = true
+    /// Favour the scene's dominant hue family over a muddy average.
+    var dominantColour: Bool? = true
+    /// Calm in quiet scenes, quick in action. Flashes stay instant either way.
+    var sceneAware: Bool? = true
     var gamma = 1.6
     var audioDepth = 0.15
     var edgeDepth = 0.20
@@ -116,6 +120,8 @@ private struct AppSettings: Codable {
         c.attackTime = mode == .ambient ? max(0.5, response) : min(response, 0.05)
         c.releaseTime = mode == .ambient ? max(1.5, afterglow ?? 0.8) : (afterglow ?? 0.8)
         c.hardwareBrightness = lampDimming ?? true
+        c.dominantColour = dominantColour ?? true
+        c.sceneAware = sceneAware ?? true
         c.gamma = gamma; c.audioDepth = audioDepth; c.audio = mode == .sound
         c.edgeDepth = edgeDepth; c.excludeSubtitles = excludeSubtitles; c.letterbox = letterbox
         c.bleRate = bleRate ?? 15
@@ -195,6 +201,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var subtitleToggle = NSButton(checkboxWithTitle: "Reduce subtitle influence near the bottom", target: nil, action: nil)
     private var letterboxToggle = NSButton(checkboxWithTitle: "Detect letterbox and pillarbox borders", target: nil, action: nil)
     private var lampDimmingToggle = NSButton(checkboxWithTitle: "Let the lamp do the dimming (finer steps in dark scenes)", target: nil, action: nil)
+    private var dominantToggle = NSButton(checkboxWithTitle: "Pick the dominant colour (keeps sunsets warm, avoids muddy mixes)", target: nil, action: nil)
+    private var sceneAwareToggle = NSButton(checkboxWithTitle: "Adapt to the scene (calm in quiet moments, quick in action)", target: nil, action: nil)
     private var reverseLeftToggle = NSButton(checkboxWithTitle: "Reverse left bar", target: nil, action: nil)
     private var reverseRightToggle = NSButton(checkboxWithTitle: "Reverse right bar", target: nil, action: nil)
     private var swapToggle = NSButton(checkboxWithTitle: "Swap left and right outputs", target: nil, action: nil)
@@ -498,7 +506,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               sliderRow("audioDepth", title: "Audio depth", value: settings.audioDepth, range: 0...1),
               sliderRow("edgeDepth", title: "Edge depth", value: settings.edgeDepth, range: 0.05...0.4),
               lampDimmingToggleConfigured(),
+              configured(dominantToggle, on: settings.dominantColour ?? true),
+              configured(sceneAwareToggle, on: settings.sceneAware ?? true),
               note("Start dim and increase to suit the room. Lower response time reacts faster. Afterglow sets how slowly the light fades after a bright moment; brightening stays instant. Audio depth applies to Sound + Movie; edge depth controls how far perimeter sampling reaches into the picture.")])
+    }
+    private func configured(_ toggle: NSButton, on: Bool) -> NSView {
+        toggle.state = on ? .on : .off
+        toggle.target = self; toggle.action = #selector(toggleChanged)
+        return toggle
     }
     private func lampDimmingToggleConfigured() -> NSView {
         lampDimmingToggle.state = (settings.lampDimming ?? true) ? .on : .off
@@ -643,7 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for (key, value) in [("brightness", defaults.brightness), ("saturation", defaults.saturation), ("darkLift", defaults.darkLift), ("response", defaults.response), ("afterglow", defaults.afterglow ?? 0.8), ("gamma", defaults.gamma), ("audioDepth", defaults.audioDepth), ("edgeDepth", defaults.edgeDepth)] {
             sliders[key]?.doubleValue = value; updateSliderLabel(key)
         }
-        subtitleToggle.state = .on; letterboxToggle.state = .on; lampDimmingToggle.state = .on; markPending()
+        subtitleToggle.state = .on; letterboxToggle.state = .on; lampDimmingToggle.state = .on; dominantToggle.state = .on; sceneAwareToggle.state = .on; markPending()
     }
 
     // MARK: Validate and apply once
@@ -706,6 +721,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.edgeDepth = sliders["edgeDepth"]!.doubleValue
         next.afterglow = sliders["afterglow"]!.doubleValue
         next.lampDimming = lampDimmingToggle.state == .on
+        next.dominantColour = dominantToggle.state == .on
+        next.sceneAware = sceneAwareToggle.state == .on
         next.excludeSubtitles = subtitleToggle.state == .on; next.letterbox = letterboxToggle.state == .on
         for index in 0..<2 {
             let values = gainFields[index].compactMap { Double($0.stringValue) }

@@ -44,6 +44,13 @@ struct Config {
     /// colour at full range, instead of scaling colour down in software. At low
     /// brightness that leaves far more 8-bit steps for dark scenes.
     var hardwareBrightness = true
+
+    /// Weight each pixel by how common its hue is, so the scene's dominant
+    /// colour family wins over a muddy average of competing ones.
+    var dominantColour = false
+    /// Calm colour and longer afterglow while the picture is still; quicker
+    /// tracking while it is busy. Brightness attack is unaffected.
+    var sceneAware = false
     var leftGain = [1.0, 1.0, 1.0]
     var rightGain = [1.0, 1.0, 1.0]
     var reverseLeft = false
@@ -208,6 +215,8 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
         case "--release-ms":  c.releaseTime = (Double(val()) ?? 600) / 1000
         case "--hw-brightness":    c.hardwareBrightness = true
         case "--no-hw-brightness": c.hardwareBrightness = false
+        case "--dominant-colour":  c.dominantColour = true
+        case "--scene-aware":      c.sceneAware = true
         case "--black-point": c.blackPoint = Double(val()) ?? 0.025
         case "--include-subtitles": c.excludeSubtitles = false
         case "--reverse-left": c.reverseLeft = true
@@ -299,6 +308,8 @@ func parseArgs(_ argv: [String] = Array(CommandLine.arguments.dropFirst())) -> C
               --attack-ms <n>      brightness rise time (50); keeps flashes instant
               --release-ms <n>     brightness fall time (600); the afterglow
               --no-hw-brightness   scale brightness in software, not on the lamp
+              --dominant-colour    favour the scene's dominant hue over the mean
+              --scene-aware        calmer when still, quicker when busy
               --black-point <n>    black threshold (movie: 0.025)
               --include-subtitles include bottom-centre text in sampling
               --left-gain <r,g,b>  channel calibration multipliers (0...2)
