@@ -1,0 +1,56 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Movie Mode Test</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#000;overflow:hidden}
+  /* A 2.35:1 picture centred in the viewport, so fullscreening this produces
+     real black bars top and bottom -- exactly what the detector must find. */
+  #stage{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
+         aspect-ratio:2.35/1;max-height:100%;margin:auto;
+         transition:background 1.2s ease-in-out;
+         display:flex;align-items:center;justify-content:center}
+  #name{font:800 4.5vw system-ui,-apple-system,sans-serif;letter-spacing:.08em;
+        color:#fff;mix-blend-mode:overlay;text-transform:uppercase}
+  #hint{position:fixed;left:0;right:0;bottom:2vh;text-align:center;
+        font:500 1.2vw system-ui,sans-serif;color:#4a4a4a;letter-spacing:.04em}
+  #bar{position:fixed;left:0;top:0;height:3px;background:#ffffff33;width:0}
+</style></head>
+<body>
+  <div id="stage"><div id="name">—</div></div>
+  <div id="bar"></div>
+  <div id="hint">press F for fullscreen · Esc to exit · watch "picture" shrink in the terminal</div>
+<script>
+  const scenes = [
+    ["Deep Ocean",   "#001a4d", "#0066b3", "#00204d"],
+    ["Sunset",       "#5a1800", "#ff6a00", "#ffb400"],
+    ["Forest",       "#04210d", "#1f8a3c", "#0a3d18"],
+    ["Neon Night",   "#1a0030", "#c400a8", "#2a0050"],
+    ["Blood Red",    "#2a0000", "#cc0a0a", "#3d0000"],
+    ["Snow",         "#aebfd4", "#ffffff", "#c3d2e0"],
+    ["Night Scene",  "#000308", "#06121f", "#000206"],
+    ["Amber Desert", "#3d2200", "#d98b14", "#5c3a05"]
+  ];
+
+  const stage = document.getElementById('stage');
+  const name  = document.getElementById('name');
+  const bar   = document.getElementById('bar');
+  const HOLD  = 7000;
+  let i = 0, t0 = Date.now();
+
+  function next(){
+    const [n, a, b, c] = scenes[i % scenes.length];
+    stage.style.background = `linear-gradient(160deg, ${a}, ${b} 55%, ${c})`;
+    name.textContent = n;
+    i++; t0 = Date.now();
+  }
+  next();
+  setInterval(next, HOLD);
+  setInterval(() => { bar.style.width = ((Date.now() - t0) / HOLD * 100) + '%'; }, 80);
+
+  addEventListener('keydown', e => {
+    if (e.key.toLowerCase() === 'f') {
+      document.fullscreenElement ? document.exitFullscreen()
+                                 : document.documentElement.requestFullscreen();
+    }
+  });
+</script></body></html>
