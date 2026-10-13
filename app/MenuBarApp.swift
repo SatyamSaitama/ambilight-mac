@@ -117,12 +117,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) {
         runner.stop()
         // Leave the lamp off rather than frozen on the last frame.
-        let sem = DispatchSemaphore(value: 0)
+        // Pump the run loop rather than blocking it: the BLE completion is
+        // dispatched to the main queue, so a semaphore wait here deadlocks
+        // until its own timeout and the lamp never gets the off frame.
+        var done = false
         runner.send(device: device,
                     frames: [Data([0x7E, 0x07, 0x04, 0x00, 0x01, 0x00, 0x02, 0x01, 0xEF])]) {
-            sem.signal()
+            done = true
         }
-        _ = sem.wait(timeout: .now() + 2.5)
+        let deadline = Date().addingTimeInterval(2.5)
+        while !done && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
     }
 
     private func setIcon(_ name: String) {

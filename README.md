@@ -42,9 +42,14 @@ SERVICE FFF0
 `MELK-*` names are SYMPHONY type 30 and use **plain, unencrypted** frames. Only
 `ELK-*` devices use the encrypted 21-byte variant, so none of that applies here.
 
-**The strip is addressable, but you cannot address it.** The E1 frame is a fixed
-9 bytes with five payload slots, no fragmentation and no sequence numbers — it
-is structurally incapable of carrying pixel data. The per-pixel capability lives
+**The strip is addressable, but no command was found that addresses it.** The
+E1 frame is a fixed 9 bytes with five payload slots. That is too small for a
+framebuffer, though not in principle too small for an index-plus-RGB write
+across several commands — so "impossible" would be too strong. What is
+established is weaker and empirical: *no verified segment command exists.* Six
+payload shapes for `CUSTOM` and `PHONE_MAI_RHYTHM` were probed on this unit and
+all were inert, and two independent reverse-engineering projects both describe
+the control granularity as single-zone. The per-pixel capability lives
 in the controller's firmware and is only reachable through its own canned
 effects. One solid color per write is the ceiling. Per-zone requires replacing
 the controller (see below).
@@ -303,6 +308,26 @@ silence at 55% instead of 40%.
 
 The `audio` figure in the status line prints `EXTRACT-FAIL=n` if buffers ever
 stop yielding samples again.
+
+### Corrections from a second protocol source
+
+[wporter82/lotus-lamp-python](https://github.com/wporter82/lotus-lamp-python),
+tested against a MELK-OA10 5F, contradicts or extends the first source:
+
+- **The `len` byte is not constant.** `SPEED` uses `04`, not `07`, and the clock
+  command uses `06`. Our `--speed` was sending the wrong frame, which is the
+  likely reason it never visibly did anything.
+- **`MODE` has ~213 animations, not 4**, grouped into categories (trans, tail,
+  water, curtain, run, flow). Only 1-4 were previously documented. They still
+  ignore `COLOR`, so they cannot follow the screen — but there is far more there
+  than Jump/Strobe/Breathe/Warning.
+- **Measured safe write rate is ~10/sec**, below our 15-20 ceiling. The deadband
+  means we rarely sustain that, but it is worth knowing.
+- **Do not send a zero `len` byte.** `7E 00 05 ...` and `7E 00 06 ...` are
+  reported to freeze the lamp until it is power-cycled.
+- Two new opcodes: `0x82` timer schedule, `0x83` clock sync.
+- That source has no `MIC`, `SET_SCENE`, `0x40`, `0x76` or `0x87`, so our notes
+  remain broader on effects.
 
 ### Letterbox detection
 
